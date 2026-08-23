@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "defaultReserveVramMiB": 1024,
+  "defaultMaxGpuUtilizationPercent": 10,
+  "cases": [
+    {
+      "id": "blender-headless-smoke",
+      "label": "Blender headless GLB export",
+      "phase": "postprocess",
+      "runner": "blender",
+      "minimumTotalVramMiB": 0,
+      "estimatedVramMiB": 0,
+      "modelId": null,
+      "requiredExecutable": "blender",
+      "alwaysDeferred": false
+    },
+    {
+      "id": "sf3d-fast-preview",
+      "label": "Stable Fast 3D single-image preview",
+      "phase": "preview",
+      "runner": "isolated-3d-worker",
+      "minimumTotalVramMiB": 6144,
+      "estimatedVramMiB": 6144,
+      "modelId": "stable-fast-3d",
+      "requiredExecutable": null,
+      "alwaysDeferred": false
+    },
+    {
+      "id": "triposg-geometry",
+      "label": "TripoSG geometry generation",
+      "phase": "geometry",
+      "runner": "isolated-3d-worker",
+      "minimumTotalVramMiB": 8192,
+      "estimatedVramMiB": 8192,
+      "modelId": "triposg",
+      "requiredExecutable": null,
+      "alwaysDeferred": false
+    },
+    {
+      "id": "hunyuan3d21-shape",
+      "label": "Hunyuan3D 2.1 shape generation",
+      "phase": "geometry",
+      "runner": "isolated-3d-worker",
+      "minimumTotalVramMiB": 10240,
+      "estimatedVramMiB": 12288,
+      "modelId": "hunyuan3d-2.1-shape",
+      "requiredExecutable": null,
+      "alwaysDeferred": false
+    },
+    {
+      "id": "hunyuan3d21-paint",
+      "label": "Hunyuan3D 2.1 PBR texture",
+      "phase": "texture",
+      "runner": "isolated-3d-worker",
+      "minimumTotalVramMiB": 21504,
+      "estimatedVramMiB": 21504,
+      "modelId": "hunyuan3d-2.1-paint",
+      "requiredExecutable": null,
+      "alwaysDeferred": false
+    },
+    {
+      "id": "trellis2-hero-pbr",
+      "label": "TRELLIS.2 hero-quality PBR asset",
+      "phase": "hero",
+      "runner": "isolated-3d-worker-linux",
+      "minimumTotalVramMiB": 24000,
+      "estimatedVramMiB": 22528,
+      "modelId": "trellis.2-4b",
+      "requiredExecutable": null,
+      "alwaysDeferred": false
+    },
+    {
+      "id": "local-3d-finetune",
+      "label": "Local 3D fine-tuning",
+      "phase": "training",
+      "runner": "dedicated-training-worker",
+      "minimumTotalVramMiB": 24576,
+      "estimatedVramMiB": 24576,
+      "modelId": "operator-selected-training-stack",
+      "requiredExecutable": null,
+      "alwaysDeferred": true
+    }
+  ]
+}
