@@ -401,7 +401,11 @@ async fn proxy_allowlist_rejects_bare_history_and_unknown_custom_reads() {
     );
     for path in [
         "object_info/CheckpointLoaderSimple",
+        "object_info/CLIPLoader",
+        "object_info/UNETLoader",
+        "object_info/VAELoader",
         "frameweaver/lora_meta",
+        "system_stats",
     ] {
         assert_eq!(
             reqwest::get(format!("{base_url}/comfy/{path}"))

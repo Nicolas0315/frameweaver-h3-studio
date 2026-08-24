@@ -1,18 +1,10 @@
 import { client, useGenerationStore } from '../store/generation'
 
-function formatGb(bytes: number): string {
-  return (bytes / 1024 ** 3).toFixed(1)
-}
-
 export function Header() {
   const connected = useGenerationStore((s) => s.connected)
-  const vram = useGenerationStore((s) => s.vram)
   const queueRemaining = useGenerationStore((s) => s.queueRemaining)
   const stop = useGenerationStore((s) => s.stop)
   const setGuideOpen = useGenerationStore((s) => s.setGuideOpen)
-
-  const vramUsed = vram ? vram.total - vram.free : 0
-  const vramPct = vram && vram.total > 0 ? Math.min(100, (vramUsed / vram.total) * 100) : 0
 
   return (
     <header className="flex flex-wrap items-center gap-2 border-b border-cream-200 bg-white px-3 py-3 sm:gap-4 sm:px-5">
@@ -28,15 +20,6 @@ export function Header() {
       </div>
 
       <div className="flex w-full flex-wrap items-center gap-2 xl:ml-auto xl:w-auto xl:gap-3">
-        <div className="flex items-center gap-2 rounded-lg border border-cream-200 px-3 py-1.5">
-          <span className="text-[10px] font-bold tracking-wider text-ink-400">COMFY使用</span>
-          <div className="hidden h-1.5 w-24 overflow-hidden rounded-full bg-cream-200 sm:block">
-            <div className="h-full rounded-full bg-accent-500 transition-all" style={{ width: `${vramPct}%` }} />
-          </div>
-          <span className="text-xs tabular-nums text-ink-600">
-            {vram ? `${formatGb(vramUsed)} / ${formatGb(vram.total)} GB` : '--'}
-          </span>
-        </div>
         <button
           onClick={() => void stop()}
           className="rounded-lg border border-red-200 bg-red-50 px-3 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-100"
