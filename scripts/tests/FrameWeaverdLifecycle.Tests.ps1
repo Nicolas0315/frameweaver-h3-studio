@@ -141,7 +141,11 @@ function Wait-FrameWeaverdExitReceipt {
         [Parameter(Mandatory = $true)][string]$ExitCodePath
     )
 
-    $Process.WaitForExit()
+    $deadline = (Get-Date).ToUniversalTime().AddSeconds(15)
+    $remaining = [int][Math]::Max(0, ($deadline - (Get-Date).ToUniversalTime()).TotalMilliseconds)
+    if ($remaining -eq 0 -or -not $Process.WaitForExit($remaining)) { throw "runner exit timed out after 15 seconds (pid=$($Process.Id))" }
+    $lease = $script:ownedFrameWeaverdProcesses[[string]$Process.Id]
+    Close-FrameWeaverdExitCapture -Lease $lease -DeadlineUtc $deadline
     $Process.Refresh()
     if (-not $Process.HasExited) { throw "runner did not exit (pid=$($Process.Id))" }
     $exitCode = $Process.ExitCode
@@ -160,10 +164,35 @@ function Start-FrameWeaverdExitCapturedPowerShell {
     # The returned process is the fixture itself. Cache its Handle before it can
     # exit so Windows PowerShell retains the actual exit code for the receipt.
     $commandLine = ConvertTo-FrameWeaverdNativeCommandLine -Arguments $ChildArguments
-    $process = Start-Process -FilePath powershell.exe -ArgumentList $commandLine -RedirectStandardOutput $StandardOutputPath -RedirectStandardError $StandardErrorPath -WindowStyle Hidden -PassThru
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'powershell.exe'; $startInfo.Arguments = $commandLine
+    $startInfo.UseShellExecute = $false; $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true; $startInfo.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new(); $process.StartInfo = $startInfo
+    if (-not $process.Start()) { throw 'fixture runner did not start' }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
     $null = $process.Handle
-    Register-FrameWeaverdOwnedProcess -Process $process | Out-Null
+    $lease = Register-FrameWeaverdOwnedProcess -Process $process
+    $lease | Add-Member NoteProperty CaptureTasks @($stdoutTask,$stderrTask)
+    $lease | Add-Member NoteProperty CapturePaths @($StandardOutputPath,$StandardErrorPath)
     return $process
+}
+
+function Close-FrameWeaverdExitCapture {
+    param([Parameter(Mandatory = $true)]$Lease, [datetime]$DeadlineUtc)
+    if (-not $lease -or -not $lease.CaptureTasks) { return }
+    if (-not $DeadlineUtc) { $DeadlineUtc = (Get-Date).ToUniversalTime().AddSeconds(15) }
+    for ($index = 0; $index -lt $lease.CaptureTasks.Count; $index++) {
+        $remaining = [int][Math]::Max(0, ($DeadlineUtc - (Get-Date).ToUniversalTime()).TotalMilliseconds)
+        if ($remaining -eq 0 -or -not $lease.CaptureTasks[$index].Wait($remaining)) {
+            throw "fixture capture drain timed out (pid=$($Lease.Id), stream=$index)"
+        }
+        $content = $lease.CaptureTasks[$index].GetAwaiter().GetResult()
+        [IO.File]::WriteAllText($lease.CapturePaths[$index], $content, [Text.Encoding]::UTF8)
+        if (-not (Test-Path -LiteralPath $lease.CapturePaths[$index])) { throw "fixture capture output missing: $($lease.CapturePaths[$index])" }
+    }
+    $lease.CaptureTasks = $null
 }
 
 function Get-LoopbackPortObservation {
@@ -303,9 +332,91 @@ function Stop-FrameWeaverdOwnedProcess {
     if (-not (Test-FrameWeaverdOwnedProcessLease -Lease $Lease)) { return $false }
     try {
         $Lease.Process.Kill()
-        $Lease.Process.WaitForExit()
-        return $true
+        if (-not $Lease.Process.WaitForExit(15000)) { return $false }
+        $Lease.Process.Refresh()
+        return $Lease.Process.HasExited
     } catch { return $false }
+}
+
+function Assert-FrameWeaverdOwnedProcessStopped {
+    param(
+        [Parameter(Mandatory = $true)]$Lease,
+        [scriptblock]$StopOperation = ${function:Stop-FrameWeaverdOwnedProcess}
+    )
+
+    # A stale lease is already terminal; only a live lease may authorize a stop.
+    if (Test-FrameWeaverdOwnedProcessLease -Lease $Lease) {
+        if (-not [bool](& $StopOperation $Lease)) {
+            throw "owned fixture process could not be stopped (pid=$($Lease.Id), nonce=$($Lease.Nonce))"
+        }
+        if (Test-FrameWeaverdOwnedProcessLease -Lease $Lease) {
+            throw "owned fixture process is still live after stop (pid=$($Lease.Id), nonce=$($Lease.Nonce))"
+        }
+    }
+}
+
+function Assert-FrameWeaverdFixtureCleanup {
+    $failures = @()
+    # Roots first prevents a watchdog from creating a replacement while child
+    # leases are being collected. Every stop remains guarded by its own lease.
+    $roots = @($script:ownedFrameWeaverdProcesses.Values | Where-Object { -not $_.ParentNonce })
+    foreach ($lease in $roots) { try { Assert-FrameWeaverdOwnedProcessStopped -Lease $lease } catch { $failures += $_.Exception.Message } }
+    foreach ($lease in @($script:ownedFrameWeaverdProcesses.Values)) {
+        try { Assert-FrameWeaverdOwnedProcessStopped -Lease $lease } catch { $failures += $_.Exception.Message }
+    }
+    $deadline = (Get-Date).ToUniversalTime().AddSeconds(15)
+    foreach ($lease in @($script:ownedFrameWeaverdProcesses.Values)) {
+        try { Close-FrameWeaverdExitCapture -Lease $lease -DeadlineUtc $deadline } catch { $failures += $_.Exception.Message }
+        finally { try { $lease.Process.Dispose() } catch { $failures += "fixture process dispose failed (pid=$($lease.Id)): $($_.Exception.Message)" } }
+    }
+    if ($failures.Count -gt 0) { throw "fixture cleanup failed: $($failures -join '; ')" }
+}
+
+function Get-FrameWeaverdFixtureProcessObservation {
+    param([int[]]$ProcessIds)
+
+    $observed = @()
+    foreach ($processId in @($ProcessIds | Where-Object { $_ -gt 0 } | Select-Object -Unique)) {
+        $process = CimCmdlets\Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue
+        $observed += [pscustomobject]@{
+            pid = $processId
+            live = [bool]$process
+            parent_pid = if ($process) { [int]$process.ParentProcessId } else { $null }
+            name = if ($process) { $process.Name } else { $null }
+            creation_date = if ($process) { [string]$process.CreationDate } else { $null }
+        }
+    }
+    return $observed
+}
+
+function Assert-FrameWeaverdFixturePathsReleased {
+    param(
+        [string[]]$Paths,
+        [int[]]$ProcessIds,
+        [Parameter(Mandatory = $true)][string]$ObservationPath
+    )
+
+    $pathObservations = @()
+    foreach ($path in @($Paths)) {
+        if (-not $path -or -not (Test-Path -LiteralPath $path)) { throw "fixture capture output missing: $path" }
+        $released = $false
+        $errorText = $null
+        try {
+            $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            $stream.Dispose()
+            $released = $true
+        } catch { $errorText = $_.Exception.Message }
+        $pathObservations += [pscustomobject]@{ path = $path; released = $released; error = $errorText }
+    }
+    $observation = [pscustomobject]@{
+        observed_at = (Get-Date).ToUniversalTime().ToString('o')
+        fixture_root = $repoRoot
+        paths = $pathObservations
+        tracked_processes = @(Get-FrameWeaverdFixtureProcessObservation -ProcessIds $ProcessIds)
+    }
+    [IO.File]::WriteAllText($ObservationPath, ($observation | ConvertTo-Json -Depth 6), [Text.Encoding]::UTF8)
+    $locked = @($pathObservations | Where-Object { -not $_.released })
+    if ($locked.Count -gt 0) { throw "fixture output handle remained locked; observation=$ObservationPath; paths=$($locked.path -join ',')" }
 }
 
 function Get-FrameWeaverdRegisteredDescendantLeases {
@@ -326,14 +437,40 @@ function Stop-FrameWeaverdTestProcess {
     $lease = $script:ownedFrameWeaverdProcesses[[string]$Process.Id]
     if (-not $lease) { return $false }
     $stopped = $false
+    # A watchdog can turn a child termination into a restart.  Stop its owned
+    # runner first, then collect already-registered descendants; this preserves
+    # the lease proof while preventing a cleanup-created replacement child.
+    if (Stop-FrameWeaverdOwnedProcess -Lease $lease) { $stopped = $true }
     foreach ($descendantLease in @(Get-FrameWeaverdRegisteredDescendantLeases -ParentLease $lease)) {
         if (Stop-FrameWeaverdOwnedProcess -Lease $descendantLease) { $stopped = $true }
     }
-    if (Stop-FrameWeaverdOwnedProcess -Lease $lease) { $stopped = $true }
+    Close-FrameWeaverdExitCapture -Lease $lease
     return $stopped
 }
 
 Describe 'FrameWeaverd Scheduled Task lifecycle' {
+    BeforeAll { $script:frameWeaverdInitialTestDrive = [IO.Path]::GetFullPath($TestDrive) }
+    AfterEach {
+        Assert-FrameWeaverdFixtureCleanup
+    }
+
+    AfterAll {
+        $testDrivePath = [IO.Path]::GetFullPath($TestDrive)
+        $tempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        $tempPrefix = $tempRoot + [IO.Path]::DirectorySeparatorChar
+        if ($testDrivePath -ne $script:frameWeaverdInitialTestDrive -or $testDrivePath -eq $tempRoot -or -not $testDrivePath.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'unsafe TestDrive cleanup path' }
+        if (Test-Path -LiteralPath $testDrivePath) {
+            $item = Get-Item -LiteralPath $testDrivePath -Force
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'unsafe TestDrive reparse path' }
+            try {
+                Remove-Item -LiteralPath $testDrivePath -Force -Recurse -ErrorAction Stop
+            } catch {
+                throw "fixture TestDrive cleanup failed: $($_.Exception.Message)"
+            }
+            if (Test-Path -LiteralPath $TestDrive) { throw "fixture TestDrive cleanup left path behind: $TestDrive" }
+        }
+    }
+
     It 'captures runner PID exit status and bounded output tails for diagnostics' {
         $stdoutPath = Join-Path $TestDrive 'runner.stdout.log'
         $stderrPath = Join-Path $TestDrive 'runner.stderr.log'
@@ -400,7 +537,22 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
             $sentinel.Refresh()
             $sentinel.HasExited | Should Be $false
         } finally {
-            try { if (-not $sentinel.HasExited) { $sentinel.Kill(); $sentinel.WaitForExit() } } catch {}
+            Assert-FrameWeaverdOwnedProcessStopped -Lease $lease
+        }
+    }
+
+    It 'fails fixture cleanup when a verified owned lease reports a stop failure' {
+        $sleeper = Join-Path $repoRoot 'scripts\tests\fixtures\sleep-30.ps1'
+        $fixture = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$sleeper) -WindowStyle Hidden -PassThru
+        $lease = Register-FrameWeaverdOwnedProcess -Process $fixture
+        try {
+            $cleanupFailure = $null
+            try { Assert-FrameWeaverdOwnedProcessStopped -Lease $lease -StopOperation { param($ignoredLease) $false } } catch { $cleanupFailure = $_.Exception.Message }
+            $cleanupFailure | Should Match '^owned fixture process could not be stopped \(pid='
+            $fixture.Refresh()
+            $fixture.HasExited | Should Be $false
+        } finally {
+            Assert-FrameWeaverdOwnedProcessStopped -Lease $lease
         }
     }
 
@@ -423,7 +575,8 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
             $root.HasExited | Should Be $true
             (Microsoft.PowerShell.Management\Get-Process -Id $childPid -ErrorAction SilentlyContinue) | Should Be $null
         } finally {
-            try { if (-not $root.HasExited) { $root.Kill(); $root.WaitForExit() } } catch {}
+            $rootLease = $script:ownedFrameWeaverdProcesses[[string]$root.Id]
+            if ($rootLease) { Assert-FrameWeaverdOwnedProcessStopped -Lease $rootLease }
         }
     }
 
@@ -701,6 +854,7 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
         $runnerStdoutPath = Join-Path $TestDrive "watchdog-runner-$runId.stdout.log"
         $runnerStderrPath = Join-Path $TestDrive "watchdog-runner-$runId.stderr.log"
         $runnerExitCodePath = Join-Path $TestDrive "watchdog-runner-$runId.exitcode"
+        $cleanupObservationPath = Join-Path $env:TEMP "frameweaver-watchdog-cleanup-$runId.json"
         $previousComfy = $env:FRAMEWEAVER_COMFY_URL
         $previousLocalAppData = $env:LOCALAPPDATA
         $previousShadowAddress = $env:FRAMEWEAVER_SHADOW_COMFY_ADDR
@@ -752,14 +906,25 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
             ([array]::IndexOf($events, $restart[0]) -lt [array]::IndexOf($events, $starting[0])) | Should Be $true
             ([array]::IndexOf($events, $starting[0]) -lt [array]::IndexOf($events, $ready[0])) | Should Be $true
         } finally {
+            $cleanupPids = @($runnerProcess.Id, $shadowProcess.Id, $firstDaemonPid, $secondDaemonPid)
             $env:FRAMEWEAVER_COMFY_URL = $previousComfy
             $env:LOCALAPPDATA = $previousLocalAppData
             $env:FRAMEWEAVER_SHADOW_COMFY_ADDR = $previousShadowAddress
             if ($logReadLock) { $logReadLock.Dispose() }
-            if ($runnerProcess) { Stop-FrameWeaverdTestProcess $runnerProcess }
-            if ($firstDaemonLease) { Stop-FrameWeaverdOwnedProcess -Lease $firstDaemonLease | Out-Null }
-            if ($secondDaemonLease) { Stop-FrameWeaverdOwnedProcess -Lease $secondDaemonLease | Out-Null }
-            if ($shadowProcess) { Stop-FrameWeaverdTestProcess $shadowProcess }
+            if ($runnerProcess) {
+                $runnerLease = $script:ownedFrameWeaverdProcesses[[string]$runnerProcess.Id]
+                if (-not $runnerLease) { throw "fixture runner has no owned lease (pid=$($runnerProcess.Id))" }
+                Assert-FrameWeaverdOwnedProcessStopped -Lease $runnerLease
+            }
+            if ($firstDaemonLease) { Assert-FrameWeaverdOwnedProcessStopped -Lease $firstDaemonLease }
+            if ($secondDaemonLease) { Assert-FrameWeaverdOwnedProcessStopped -Lease $secondDaemonLease }
+            if ($shadowProcess) {
+                $shadowLease = $script:ownedFrameWeaverdProcesses[[string]$shadowProcess.Id]
+                if (-not $shadowLease) { throw "fixture shadow has no owned lease (pid=$($shadowProcess.Id))" }
+                Assert-FrameWeaverdOwnedProcessStopped -Lease $shadowLease
+            }
+            if ($runnerLease) { Close-FrameWeaverdExitCapture -Lease $runnerLease -DeadlineUtc ((Get-Date).ToUniversalTime().AddSeconds(15)) }
+            Assert-FrameWeaverdFixturePathsReleased -Paths @($runnerStdoutPath, $runnerStderrPath) -ProcessIds $cleanupPids -ObservationPath $cleanupObservationPath
         }
     }
 
