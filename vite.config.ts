@@ -1,4 +1,5 @@
-import { defineConfig, type ProxyOptions } from 'vite'
+import { defineConfig } from 'vitest/config'
+import type { ProxyOptions } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { discordAuthPlugin } from './server/discord-auth.js'
@@ -33,6 +34,12 @@ const rewriterPlugin = {
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [discordAuthPlugin(), react(), tailwindcss(), rewriterPlugin],
+  test: {
+    // Root Vitest must not discover tests from isolated worktrees. Those
+    // worktrees have their own dependency/setup state and are verified
+    // separately, so including them causes cross-worktree matcher failures.
+    exclude: ['**/node_modules/**', '**/.worktrees/**'],
+  },
   server: {
     host: '127.0.0.1',
     port: 5180,

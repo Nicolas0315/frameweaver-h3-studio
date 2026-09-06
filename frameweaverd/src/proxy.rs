@@ -231,8 +231,12 @@ fn allowed_http_route(method: &axum::http::Method, path: &str) -> bool {
         return false;
     }
     path == "view"
+        || path == "system_stats"
         || path == "object_info/LoraLoaderModelOnly"
         || path == "object_info/CheckpointLoaderSimple"
+        || path == "object_info/CLIPLoader"
+        || path == "object_info/UNETLoader"
+        || path == "object_info/VAELoader"
         || path == "frameweaver/lora_meta"
         || path
             .strip_prefix("history/")
