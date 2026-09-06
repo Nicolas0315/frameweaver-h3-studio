@@ -26,7 +26,10 @@ $BinaryPath = (Resolve-Path -LiteralPath $BinaryPath).Path
 New-Item -ItemType Directory -Force -Path $LogDirectory | Out-Null
 
 function Prune-OldLogs {
-    Get-ChildItem -LiteralPath $LogDirectory -File | Where-Object { $_.Name -like 'frameweaverd-*' -and $_.Extension -in '.jsonl', '.stdout', '.stderr' -and $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | Remove-Item -Force
+    foreach ($file in @(Get-ChildItem -LiteralPath $LogDirectory -File | Where-Object { $_.Name -like 'frameweaverd-*' -and $_.Extension -in '.jsonl', '.stdout', '.stderr' -and $_.LastWriteTime -lt (Get-Date).AddDays(-7) })) {
+        if ($script:jsonl -and $file.FullName -eq $script:jsonl) { continue }
+        try { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop } catch {}
+    }
 }
 Prune-OldLogs
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -40,13 +43,54 @@ function Get-LogDateKey {
 $script:eventCount = 0
 $script:dateKey = Get-LogDateKey
 $script:sequence = 0
+$script:logInstanceId = [guid]::NewGuid().ToString('N')
 $script:jsonl = $null
+$script:jsonlStream = $null
+$script:jsonlWriter = $null
+function Close-LogWriter {
+    if ($script:jsonlWriter) {
+        $script:jsonlWriter.Flush()
+        $script:jsonlWriter.Dispose()
+        $script:jsonlWriter = $null
+        $script:jsonlStream = $null
+    } elseif ($script:jsonlStream) {
+        $script:jsonlStream.Dispose()
+        $script:jsonlStream = $null
+    }
+}
 function New-LogFile {
-    Prune-OldLogs
+    $newDateKey = Get-LogDateKey
     $script:sequence++
-    $script:dateKey = Get-LogDateKey
-    $script:jsonl = Join-Path $LogDirectory "frameweaverd-$script:dateKey-$stamp-$script:sequence.jsonl"
-    [IO.File]::WriteAllText($script:jsonl, '', [Text.Encoding]::UTF8)
+    $sequenceKey = '{0:D6}' -f $script:sequence
+    $newPath = Join-Path $LogDirectory "frameweaverd-$newDateKey-$stamp-$PID-$script:logInstanceId-$sequenceKey.jsonl"
+    $newStream = $null
+    $newWriter = $null
+    try {
+        $newStream = [IO.FileStream]::new($newPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+        $newWriter = [IO.StreamWriter]::new($newStream, [Text.UTF8Encoding]::new($false))
+        $newWriter.AutoFlush = $true
+    } catch {
+        if ($newWriter) { $newWriter.Dispose() }
+        elseif ($newStream) { $newStream.Dispose() }
+        if ($script:jsonlWriter) { return $false }
+        throw
+    }
+    $oldWriter = $script:jsonlWriter
+    $oldStream = $script:jsonlStream
+    if ($oldWriter) {
+        try { $oldWriter.Flush() } catch {
+            $newWriter.Dispose()
+            return $false
+        }
+    }
+    $script:jsonl = $newPath
+    $script:dateKey = $newDateKey
+    $script:jsonlStream = $newStream
+    $script:jsonlWriter = $newWriter
+    if ($oldWriter) { $oldWriter.Dispose() }
+    elseif ($oldStream) { $oldStream.Dispose() }
+    Prune-OldLogs
+    return $true
 }
 function Redact([string]$Value) {
     if ($null -eq $Value) { return $null }
@@ -55,15 +99,16 @@ function Redact([string]$Value) {
 function Write-Event([string]$Event, [hashtable]$Fields = @{}) {
     if (-not $script:jsonl -or $script:dateKey -ne (Get-LogDateKey) -or ((Test-Path -LiteralPath $script:jsonl) -and (Get-Item -LiteralPath $script:jsonl).Length -ge 10MB)) { New-LogFile }
     $record = @{ timestamp = (Get-Date).ToUniversalTime().ToString('o'); event = $Event } + $Fields
-    ($record | ConvertTo-Json -Compress) | Add-Content -LiteralPath $script:jsonl -Encoding UTF8
+    $script:jsonlWriter.WriteLine(($record | ConvertTo-Json -Compress))
     $script:eventCount++
 }
 New-LogFile
 
 if (Test-NetConnection 127.0.0.1 -Port $Port -InformationLevel Quiet) {
-    try { $existing = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2 } catch { Write-Event 'port_conflict' @{ port = $Port; reason = 'health_unavailable' }; exit 1 }
-    if ($existing.service -notin 'ready','ok' -or -not $existing.build) { Write-Event 'port_conflict' @{ port = $Port; reason = 'foreign_service' }; exit 1 }
+    try { $existing = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2 } catch { Write-Event 'port_conflict' @{ port = $Port; reason = 'health_unavailable' }; Close-LogWriter; exit 1 }
+    if ($existing.service -notin 'ready','ok' -or -not $existing.build) { Write-Event 'port_conflict' @{ port = $Port; reason = 'foreign_service' }; Close-LogWriter; exit 1 }
     Write-Event 'already_listening' @{ port = $Port; build = $existing.build.sha }
+    Close-LogWriter
     return [pscustomobject]@{ Started = $false; Reason = 'already_listening'; Log = $script:jsonl }
 }
 
@@ -137,6 +182,7 @@ while ($true) {
         Write-Event 'panic_or_exit' @{ exit_code = 1; pid = $process.Id; reason = 'health_timeout' }
         Unregister-Event -SourceIdentifier $outEvent -ErrorAction SilentlyContinue
         Unregister-Event -SourceIdentifier $errEvent -ErrorAction SilentlyContinue
+        Close-LogWriter
         exit 1
     }
     Write-Event 'health_ready' @{ port = $Port; pid = $process.Id; attempt = $attempt }
@@ -146,7 +192,7 @@ while ($true) {
     Write-Event ($(if ($exitCode -eq 0) { 'exit' } else { 'panic_or_exit' })) @{ exit_code = $exitCode; pid = $process.Id; attempt = $attempt }
     Unregister-Event -SourceIdentifier $outEvent -ErrorAction SilentlyContinue
     Unregister-Event -SourceIdentifier $errEvent -ErrorAction SilentlyContinue
-    if ($exitCode -eq 0 -or $attempt -ge $RestartCount) { exit $exitCode }
+    if ($exitCode -eq 0 -or $attempt -ge $RestartCount) { Close-LogWriter; exit $exitCode }
     $attempt++
     Write-Event 'watchdog_restart' @{ prior_pid = $process.Id; attempt = $attempt; delay_seconds = $RestartDelaySeconds; exit_code = $exitCode }
     if ($RestartDelaySeconds -gt 0) { Start-Sleep -Seconds $RestartDelaySeconds }

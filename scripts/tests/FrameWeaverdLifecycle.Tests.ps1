@@ -15,27 +15,28 @@ function Get-LoopbackTestPort {
 function Get-TestLogEvents {
     param([string]$LogDirectory)
 
-    $logFile = Get-ChildItem -LiteralPath $LogDirectory -Filter '*.jsonl' -ErrorAction SilentlyContinue | Select-Object -Last 1
-    if (-not $logFile) { return @() }
     $events = @()
-    $stream = $null
-    $reader = $null
-    try {
-        # The runner appends JSONL while this fixture polls.  Get-Content opens
-        # a reader that can transiently deny that append on Windows, so permit
-        # a concurrent writer explicitly.
-        $stream = [IO.File]::Open($logFile.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-        $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $true)
-        $lines = @($reader.ReadToEnd() -split "`r?`n")
-    } catch {
-        return @()
-    } finally {
-        if ($reader) { $reader.Dispose() }
-        elseif ($stream) { $stream.Dispose() }
-    }
-    foreach ($line in $lines) {
-        if (-not [string]::IsNullOrWhiteSpace($line)) {
-            try { $events += $line | ConvertFrom-Json -ErrorAction Stop } catch {}
+    foreach ($logFile in @(Get-ChildItem -LiteralPath $LogDirectory -Filter '*.jsonl' -ErrorAction SilentlyContinue | Sort-Object Name)) {
+        $stream = $null
+        $reader = $null
+        try {
+            # The runner owns a FileShare.Read writer. A cooperative tailer must
+            # both request read access and permit that existing writer.
+            $stream = [IO.File]::Open($logFile.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $true)
+            $lines = @($reader.ReadToEnd() -split "`r?`n")
+        } catch {
+            continue
+        } finally {
+            if ($reader) { $reader.Dispose() }
+            elseif ($stream) { $stream.Dispose() }
+        }
+        foreach ($line in $lines) {
+            if (-not [string]::IsNullOrWhiteSpace($line)) {
+                # A concurrently flushed line can be partial; defer it to the
+                # next poll rather than turning it into a synthetic event.
+                try { $events += $line | ConvertFrom-Json -ErrorAction Stop } catch {}
+            }
         }
     }
     return $events
@@ -410,7 +411,7 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
         $previousComfy = $env:FRAMEWEAVER_COMFY_URL
         $previousLocalAppData = $env:LOCALAPPDATA
         $previousShadowAddress = $env:FRAMEWEAVER_SHADOW_COMFY_ADDR
-        $runnerProcess = $null; $shadowProcess = $null; $firstDaemonPid = $null; $secondDaemonPid = $null
+        $runnerProcess = $null; $shadowProcess = $null; $firstDaemonPid = $null; $secondDaemonPid = $null; $logReadLock = $null; $incompatibleReaderError = $null
         try {
             $env:FRAMEWEAVER_SHADOW_COMFY_ADDR = "127.0.0.1:$shadowPort"
             $shadowProcess = Start-Process -FilePath $shadow -PassThru
@@ -424,6 +425,16 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
             $firstReady = @(Wait-FrameWeaverdLogEvent -LogDirectory $logDirectory -Predicate { $_.event -eq 'health_ready' } | Select-Object -Last 1)
             $firstDaemonPid = [int]$firstReady[0].pid
 
+            # A cooperative tailer permits the runner's already-owned writer.
+            $logFile = Get-ChildItem -LiteralPath $logDirectory -Filter '*.jsonl' | Select-Object -Last 1
+            $logReadLock = [IO.File]::Open($logFile.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try {
+                [IO.File]::Open($logFile.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read).Dispose()
+            } catch {
+                $incompatibleReaderError = $_.Exception
+            }
+            $incompatibleReaderError | Should Not Be $null
+
             Microsoft.PowerShell.Management\Stop-Process -Id $firstDaemonPid -Force
             $secondReady = @(Wait-FrameWeaverdLogEvent -LogDirectory $logDirectory -Predicate { $_.event -eq 'health_ready' -and [int]$_.pid -ne $firstDaemonPid } -TimeoutSeconds 15 -RunnerProcess $runnerProcess -RunnerStandardOutputPath $runnerStdoutPath -RunnerStandardErrorPath $runnerStderrPath -RunnerExitCodePath $runnerExitCodePath)
             $secondDaemonPid = [int]$secondReady[0].pid
@@ -432,11 +443,23 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
             $runnerProcess.Refresh()
             $runnerProcess.HasExited | Should Be $false
             $secondDaemonPid | Should Not Be $firstDaemonPid
-            @((Get-TestLogEvents $logDirectory | Where-Object { $_.event -eq 'watchdog_restart' })).Count | Should Be 1
+            $events = @(Get-TestLogEvents $logDirectory)
+            $panic = @($events | Where-Object { $_.event -eq 'panic_or_exit' -and [int]$_.pid -eq $firstDaemonPid -and [int]$_.attempt -eq 0 })
+            $restart = @($events | Where-Object { $_.event -eq 'watchdog_restart' -and [int]$_.prior_pid -eq $firstDaemonPid -and [int]$_.attempt -eq 1 })
+            $starting = @($events | Where-Object { $_.event -eq 'starting' -and [int]$_.attempt -eq 1 })
+            $ready = @($events | Where-Object { $_.event -eq 'health_ready' -and [int]$_.pid -eq $secondDaemonPid -and [int]$_.attempt -eq 1 })
+            $panic.Count | Should Be 1
+            $restart.Count | Should Be 1
+            $starting.Count | Should Be 1
+            $ready.Count | Should Be 1
+            ([array]::IndexOf($events, $panic[0]) -lt [array]::IndexOf($events, $restart[0])) | Should Be $true
+            ([array]::IndexOf($events, $restart[0]) -lt [array]::IndexOf($events, $starting[0])) | Should Be $true
+            ([array]::IndexOf($events, $starting[0]) -lt [array]::IndexOf($events, $ready[0])) | Should Be $true
         } finally {
             $env:FRAMEWEAVER_COMFY_URL = $previousComfy
             $env:LOCALAPPDATA = $previousLocalAppData
             $env:FRAMEWEAVER_SHADOW_COMFY_ADDR = $previousShadowAddress
+            if ($logReadLock) { $logReadLock.Dispose() }
             if ($runnerProcess) { Stop-FrameWeaverdTestProcess $runnerProcess }
             if ($firstDaemonPid) { Stop-FrameWeaverdTestProcess (Microsoft.PowerShell.Management\Get-Process -Id $firstDaemonPid -ErrorAction SilentlyContinue) }
             if ($secondDaemonPid) { Stop-FrameWeaverdTestProcess (Microsoft.PowerShell.Management\Get-Process -Id $secondDaemonPid -ErrorAction SilentlyContinue) }
