@@ -292,6 +292,45 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
         (Get-Process -Id $timeout.pid -ErrorAction SilentlyContinue) | Should Be $null
     }
 
+    It 'does not start the daemon when the initial lifecycle sink cannot be created' {
+        $blockedLogPath = Join-Path $TestDrive 'initial-sink-is-a-file'
+        $markerPath = Join-Path $TestDrive 'daemon-started.marker'
+        Set-Content -LiteralPath $blockedLogPath -Value 'not-a-directory'
+        $childArguments = "-NoProfile -Command `"[IO.File]::WriteAllText('$markerPath','started'); Start-Sleep -Seconds 5`""
+
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner -ProjectRoot $repoRoot -BinaryPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -BinaryArguments $childArguments -Port 15176 -HealthTimeoutSeconds 1 -LogDirectory $blockedLogPath
+
+        $LASTEXITCODE | Should Be 1
+        (Test-Path -LiteralPath $markerPath) | Should Be $false
+    }
+
+    It 'preserves all lifecycle events across rotation while a cooperative reader holds the old JSONL' {
+        $logDirectory = Join-Path $TestDrive 'rotation-reader-logs'
+        $sleeper = Join-Path $repoRoot 'scripts\tests\fixtures\sleep-30.ps1'
+        $childArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$sleeper`""
+        $stdoutPath = Join-Path $TestDrive 'rotation-reader.stdout.log'
+        $stderrPath = Join-Path $TestDrive 'rotation-reader.stderr.log'
+        $exitCodePath = Join-Path $TestDrive 'rotation-reader.exitcode'
+        $runnerProcess = Start-FrameWeaverdExitCapturedPowerShell -ChildArguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$runner,'-ProjectRoot',$repoRoot,'-BinaryPath',"$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",'-BinaryArguments',$childArguments,'-Port','15175','-HealthTimeoutSeconds','1','-LogDirectory',$logDirectory,'-TestInitialLogDateKey','20260821','-TestRotatedLogDateKey','20260822') -ExitCodePath $exitCodePath -StandardOutputPath $stdoutPath -StandardErrorPath $stderrPath
+        $oldReader = $null
+        try {
+            $deadline = (Get-Date).AddSeconds(5)
+            do { $oldLog = Get-ChildItem -LiteralPath $logDirectory -Filter '*.jsonl' -ErrorAction SilentlyContinue | Select-Object -First 1; if (-not $oldLog) { Start-Sleep -Milliseconds 50 } } while (-not $oldLog -and (Get-Date) -lt $deadline)
+            $oldLog | Should Not Be $null
+            $oldReader = [IO.File]::Open($oldLog.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            $runnerProcess.WaitForExit()
+            [int](Get-Content -LiteralPath $exitCodePath -Raw) | Should Be 1
+            $events = @(Get-TestLogEvents $logDirectory)
+            @($events | Where-Object { $_.event -eq 'starting' }).Count | Should Be 1
+            @($events | Where-Object { $_.event -eq 'health_timeout' }).Count | Should Be 1
+            @($events | Where-Object { $_.event -eq 'panic_or_exit' }).Count | Should Be 1
+            @(Get-ChildItem -LiteralPath $logDirectory -Filter '*.jsonl').Count | Should Be 2
+        } finally {
+            if ($oldReader) { $oldReader.Dispose() }
+            Stop-FrameWeaverdTestProcess $runnerProcess
+        }
+    }
+
     It 'prunes all expired log companions and rotates JSONL when the date key changes' {
         $logDirectory = Join-Path $TestDrive 'rotation-logs'
         New-Item -ItemType Directory -Path $logDirectory | Out-Null
