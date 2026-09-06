@@ -26,6 +26,71 @@ function Get-TestLogEvents {
     return $events
 }
 
+function Get-FrameWeaverdDiagnosticTail {
+    param([string]$Path)
+
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return '' }
+    return (@(Get-Content -LiteralPath $Path -Tail 20 -ErrorAction SilentlyContinue) -join "`n")
+}
+
+function Get-FrameWeaverdRunnerObservation {
+    param(
+        [System.Diagnostics.Process]$RunnerProcess,
+        [string]$StandardOutputPath,
+        [string]$StandardErrorPath,
+        [string]$ExitCodePath
+    )
+
+    $hasExited = $true
+    $runnerExitCode = $null
+    $runnerPid = $null
+    $observationError = $null
+    if ($RunnerProcess) {
+        $runnerPid = $RunnerProcess.Id
+        try {
+            $hasExited = $RunnerProcess.HasExited
+            if ($hasExited) { $runnerExitCode = $RunnerProcess.ExitCode }
+            else {
+                $RunnerProcess.Refresh()
+                $hasExited = $RunnerProcess.HasExited
+                if ($hasExited) { $runnerExitCode = $RunnerProcess.ExitCode }
+            }
+        } catch { $observationError = $_.Exception.Message }
+    }
+    if ($ExitCodePath -and (Test-Path -LiteralPath $ExitCodePath)) {
+        $capturedExitCode = Get-Content -LiteralPath $ExitCodePath -Raw -ErrorAction SilentlyContinue
+        if ($capturedExitCode -match '^-?\d+$') { $runnerExitCode = [int]$capturedExitCode }
+    }
+    return [pscustomobject]@{
+        pid = $runnerPid
+        has_exited = $hasExited
+        exit_code = $runnerExitCode
+        observation_error = $observationError
+        exit_code_path = $ExitCodePath
+        stdout_tail = Get-FrameWeaverdDiagnosticTail $StandardOutputPath
+        stderr_tail = Get-FrameWeaverdDiagnosticTail $StandardErrorPath
+    }
+}
+
+function Start-FrameWeaverdExitCapturedPowerShell {
+    param(
+        [string[]]$ChildArguments,
+        [string]$ExitCodePath,
+        [string]$StandardOutputPath,
+        [string]$StandardErrorPath
+    )
+
+    # Pass the child argv as Base64 JSON so the wrapper can preserve script paths
+    # and command text without relying on Start-Process quote reconstruction.
+    $argumentsJson = $ChildArguments | ConvertTo-Json -Compress
+    $argumentsBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($argumentsJson))
+    $wrapper = Join-Path $PSScriptRoot 'fixtures\run-exit-captured-process.ps1'
+    return Start-Process -FilePath powershell.exe -ArgumentList @(
+        '-NoProfile','-ExecutionPolicy','Bypass','-File',$wrapper,
+        '-Executable','powershell.exe','-ArgumentsBase64',$argumentsBase64,'-ExitCodePath',$ExitCodePath
+    ) -RedirectStandardOutput $StandardOutputPath -RedirectStandardError $StandardErrorPath -WindowStyle Hidden -PassThru
+}
+
 function Wait-FrameWeaverdHealth {
     param(
         [string]$Uri,
@@ -63,17 +128,28 @@ function Wait-FrameWeaverdLogEvent {
     param(
         [string]$LogDirectory,
         [scriptblock]$Predicate,
-        [int]$TimeoutSeconds = 10
+        [int]$TimeoutSeconds = 10,
+        [System.Diagnostics.Process]$RunnerProcess,
+        [string]$RunnerStandardOutputPath,
+        [string]$RunnerStandardErrorPath,
+        [string]$RunnerExitCodePath
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
+        if ($RunnerProcess) {
+            $runner = Get-FrameWeaverdRunnerObservation -RunnerProcess $RunnerProcess -StandardOutputPath $RunnerStandardOutputPath -StandardErrorPath $RunnerStandardErrorPath -ExitCodePath $RunnerExitCodePath
+            if ($runner.has_exited) {
+                throw "runner exited while waiting for lifecycle event; runner=$($runner | ConvertTo-Json -Compress); events=$((Get-TestLogEvents $LogDirectory | ConvertTo-Json -Compress))"
+            }
+        }
         $match = @(Get-TestLogEvents $LogDirectory | Where-Object $Predicate | Select-Object -Last 1)
         if ($match.Count -eq 1) { return $match[0] }
         Start-Sleep -Milliseconds 100
     } while ((Get-Date) -lt $deadline)
 
-    throw "expected lifecycle log event was not written; events=$((Get-TestLogEvents $LogDirectory | ConvertTo-Json -Compress))"
+    $runner = if ($RunnerProcess) { Get-FrameWeaverdRunnerObservation -RunnerProcess $RunnerProcess -StandardOutputPath $RunnerStandardOutputPath -StandardErrorPath $RunnerStandardErrorPath -ExitCodePath $RunnerExitCodePath | ConvertTo-Json -Compress } else { 'not-observed' }
+    throw "expected lifecycle log event was not written; runner=$runner; events=$((Get-TestLogEvents $LogDirectory | ConvertTo-Json -Compress))"
 }
 
 function Stop-FrameWeaverdTestProcess {
@@ -105,6 +181,43 @@ function Stop-FrameWeaverdTestProcess {
 }
 
 Describe 'FrameWeaverd Scheduled Task lifecycle' {
+    It 'captures runner PID exit status and bounded output tails for diagnostics' {
+        $stdoutPath = Join-Path $TestDrive 'runner.stdout.log'
+        $stderrPath = Join-Path $TestDrive 'runner.stderr.log'
+        $exitCodePath = Join-Path $TestDrive 'runner.exitcode'
+        $runnerProcess = Start-FrameWeaverdExitCapturedPowerShell -ChildArguments @('-NoProfile','-Command','Write-Output fixture-stdout; Write-Error fixture-stderr; exit 23') -ExitCodePath $exitCodePath -StandardOutputPath $stdoutPath -StandardErrorPath $stderrPath
+        $runnerProcess.WaitForExit()
+
+        $observation = Get-FrameWeaverdRunnerObservation -RunnerProcess $runnerProcess -StandardOutputPath $stdoutPath -StandardErrorPath $stderrPath -ExitCodePath $exitCodePath
+
+        $observation.pid | Should Be $runnerProcess.Id
+        $observation.has_exited | Should Be $true
+        $observation.exit_code | Should Be 23
+        $observation.stdout_tail | Should Match 'fixture-stdout'
+        $observation.stderr_tail | Should Match 'fixture-stderr'
+    }
+
+    It 'reports an exited runner before the second-event wait timeout' {
+        $stdoutPath = Join-Path $TestDrive 'exited-runner.stdout.log'
+        $stderrPath = Join-Path $TestDrive 'exited-runner.stderr.log'
+        $exitCodePath = Join-Path $TestDrive 'exited-runner.exitcode'
+        $logDirectory = Join-Path $TestDrive 'exited-runner-logs'
+        New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
+        $runnerProcess = Start-FrameWeaverdExitCapturedPowerShell -ChildArguments @('-NoProfile','-Command','Write-Error fixture-runner-error; exit 17') -ExitCodePath $exitCodePath -StandardOutputPath $stdoutPath -StandardErrorPath $stderrPath
+        $runnerProcess.WaitForExit()
+
+        $message = $null
+        try {
+            Wait-FrameWeaverdLogEvent -LogDirectory $logDirectory -Predicate { $_.event -eq 'health_ready' } -TimeoutSeconds 15 -RunnerProcess $runnerProcess -RunnerStandardOutputPath $stdoutPath -RunnerStandardErrorPath $stderrPath -RunnerExitCodePath $exitCodePath
+            throw 'expected an exited runner observation'
+        } catch {
+            $message = $_.Exception.Message
+        }
+        $message | Should Match 'runner exited'
+        $message | Should Match 'fixture-runner-error'
+        $message | Should Match '"exit_code":17'
+    }
+
     It 'renders a non-mutating task definition with the expected restart policy' {
         $taskName = "FrameWeaverd-Test-$([guid]::NewGuid())"
         $before = ScheduledTasks\Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -244,6 +357,9 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
         $runId = [guid]::NewGuid().ToString('N')
         $logDirectory = Join-Path $TestDrive "watchdog-logs-$runId"
         $dataDirectory = Join-Path $TestDrive "watchdog-localappdata-$runId"
+        $runnerStdoutPath = Join-Path $TestDrive "watchdog-runner-$runId.stdout.log"
+        $runnerStderrPath = Join-Path $TestDrive "watchdog-runner-$runId.stderr.log"
+        $runnerExitCodePath = Join-Path $TestDrive "watchdog-runner-$runId.exitcode"
         $previousComfy = $env:FRAMEWEAVER_COMFY_URL
         $previousLocalAppData = $env:LOCALAPPDATA
         $previousShadowAddress = $env:FRAMEWEAVER_SHADOW_COMFY_ADDR
@@ -256,13 +372,13 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
 
             $env:FRAMEWEAVER_COMFY_URL = "http://127.0.0.1:$shadowPort"
             $env:LOCALAPPDATA = $dataDirectory
-            $runnerProcess = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$runner,'-ProjectRoot',$repoRoot,'-BinaryPath',$daemon,'-Port',$daemonPort,'-HealthTimeoutSeconds','10','-LogDirectory',$logDirectory,'-RestartCount','1','-RestartDelaySeconds','1') -PassThru
+            $runnerProcess = Start-FrameWeaverdExitCapturedPowerShell -ChildArguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$runner,'-ProjectRoot',$repoRoot,'-BinaryPath',$daemon,'-Port',$daemonPort,'-HealthTimeoutSeconds','10','-LogDirectory',$logDirectory,'-RestartCount','1','-RestartDelaySeconds','1') -ExitCodePath $runnerExitCodePath -StandardOutputPath $runnerStdoutPath -StandardErrorPath $runnerStderrPath
             Wait-FrameWeaverdHealth -Uri "http://127.0.0.1:$daemonPort/api/health" -RunnerProcess $runnerProcess -LogDirectory $logDirectory | Out-Null
             $firstReady = @(Wait-FrameWeaverdLogEvent -LogDirectory $logDirectory -Predicate { $_.event -eq 'health_ready' } | Select-Object -Last 1)
             $firstDaemonPid = [int]$firstReady[0].pid
 
             Microsoft.PowerShell.Management\Stop-Process -Id $firstDaemonPid -Force
-            $secondReady = @(Wait-FrameWeaverdLogEvent -LogDirectory $logDirectory -Predicate { $_.event -eq 'health_ready' -and [int]$_.pid -ne $firstDaemonPid } -TimeoutSeconds 15)
+            $secondReady = @(Wait-FrameWeaverdLogEvent -LogDirectory $logDirectory -Predicate { $_.event -eq 'health_ready' -and [int]$_.pid -ne $firstDaemonPid } -TimeoutSeconds 15 -RunnerProcess $runnerProcess -RunnerStandardOutputPath $runnerStdoutPath -RunnerStandardErrorPath $runnerStderrPath -RunnerExitCodePath $runnerExitCodePath)
             $secondDaemonPid = [int]$secondReady[0].pid
             Wait-FrameWeaverdHealth -Uri "http://127.0.0.1:$daemonPort/api/health" -RunnerProcess $runnerProcess -LogDirectory $logDirectory | Out-Null
 
