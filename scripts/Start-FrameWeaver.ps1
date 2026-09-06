@@ -11,7 +11,8 @@ param(
     [ValidateRange(0, 86400)]
     [int]$RestartDelaySeconds = 60,
     [string]$TestInitialLogDateKey,
-    [string]$TestRotatedLogDateKey
+    [string]$TestRotatedLogDateKey,
+    [switch]$TestFailRotatedLogSink
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,7 +24,12 @@ if (-not $BinaryPath) {
     $BinaryPath = if (Test-Path -LiteralPath $release) { $release } elseif (Test-Path -LiteralPath $debug) { $debug } else { throw 'frameweaverd binary is missing; build it before starting the lifecycle task.' }
 }
 $BinaryPath = (Resolve-Path -LiteralPath $BinaryPath).Path
-New-Item -ItemType Directory -Force -Path $LogDirectory | Out-Null
+try {
+    New-Item -ItemType Directory -Force -Path $LogDirectory -ErrorAction Stop | Out-Null
+} catch {
+    Write-Error "initial lifecycle sink could not be created: $($_.Exception.Message)"
+    exit 1
+}
 
 function Prune-OldLogs {
     foreach ($file in @(Get-ChildItem -LiteralPath $LogDirectory -File | Where-Object { $_.Name -like 'frameweaverd-*' -and $_.Extension -in '.jsonl', '.stdout', '.stderr' -and $_.LastWriteTime -lt (Get-Date).AddDays(-7) })) {
@@ -66,14 +72,15 @@ function New-LogFile {
     $newStream = $null
     $newWriter = $null
     try {
+        if ($TestFailRotatedLogSink -and $script:jsonl) { throw [IO.IOException]::new('synthetic rotated lifecycle sink failure') }
         $newStream = [IO.FileStream]::new($newPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
         $newWriter = [IO.StreamWriter]::new($newStream, [Text.UTF8Encoding]::new($false))
         $newWriter.AutoFlush = $true
     } catch {
         if ($newWriter) { $newWriter.Dispose() }
         elseif ($newStream) { $newStream.Dispose() }
-        if ($script:jsonlWriter) { return $false }
-        throw
+        if (-not $script:jsonlWriter) { Write-Error "initial lifecycle sink could not be created: $($_.Exception.Message)" }
+        return $false
     }
     $oldWriter = $script:jsonlWriter
     $oldStream = $script:jsonlStream
@@ -97,12 +104,15 @@ function Redact([string]$Value) {
     return ($Value -replace '(?i)((token|secret|password|authorization)[^\r\n:=]*[=:]\s*)[^\s,}]+', '$1[REDACTED]' -replace '(?i)("prompt"\s*:\s*")[^"]*', '$1[REDACTED]')
 }
 function Write-Event([string]$Event, [hashtable]$Fields = @{}) {
-    if (-not $script:jsonl -or $script:dateKey -ne (Get-LogDateKey) -or ((Test-Path -LiteralPath $script:jsonl) -and (Get-Item -LiteralPath $script:jsonl).Length -ge 10MB)) { New-LogFile }
+    if (-not $script:jsonl -or $script:dateKey -ne (Get-LogDateKey) -or ((Test-Path -LiteralPath $script:jsonl) -and (Get-Item -LiteralPath $script:jsonl).Length -ge 10MB)) { New-LogFile | Out-Null }
+    if (-not $script:jsonlWriter) { throw 'lifecycle event writer is unavailable' }
     $record = @{ timestamp = (Get-Date).ToUniversalTime().ToString('o'); event = $Event } + $Fields
-    $script:jsonlWriter.WriteLine(($record | ConvertTo-Json -Compress))
+    $serialized = $record | ConvertTo-Json -Compress
+    $script:jsonlWriter.WriteLine($serialized)
+    $script:jsonlWriter.Flush()
     $script:eventCount++
 }
-New-LogFile
+if (-not (New-LogFile)) { exit 1 }
 
 if (Test-NetConnection 127.0.0.1 -Port $Port -InformationLevel Quiet) {
     try { $existing = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2 } catch { Write-Event 'port_conflict' @{ port = $Port; reason = 'health_unavailable' }; Close-LogWriter; exit 1 }

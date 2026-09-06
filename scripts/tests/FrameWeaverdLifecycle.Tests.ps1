@@ -1,6 +1,7 @@
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $installer = Join-Path $repoRoot 'scripts\Install-FrameWeaverdTask.ps1'
 $runner = Join-Path $repoRoot 'scripts\Start-FrameWeaver.ps1'
+$script:ownedFrameWeaverdProcesses = @{}
 
 function Get-LoopbackTestPort {
     $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
@@ -13,7 +14,10 @@ function Get-LoopbackTestPort {
 }
 
 function Get-TestLogEvents {
-    param([string]$LogDirectory)
+    param(
+        [string]$LogDirectory,
+        [switch]$Strict
+    )
 
     $events = @()
     foreach ($logFile in @(Get-ChildItem -LiteralPath $LogDirectory -Filter '*.jsonl' -ErrorAction SilentlyContinue | Sort-Object Name)) {
@@ -24,18 +28,28 @@ function Get-TestLogEvents {
             # both request read access and permit that existing writer.
             $stream = [IO.File]::Open($logFile.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
             $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $true)
-            $lines = @($reader.ReadToEnd() -split "`r?`n")
+            $content = $reader.ReadToEnd()
+            $lines = @($content -split "`r?`n")
         } catch {
             continue
         } finally {
             if ($reader) { $reader.Dispose() }
             elseif ($stream) { $stream.Dispose() }
         }
-        foreach ($line in $lines) {
+        $lastNonEmptyLine = -1
+        for ($lineIndex = 0; $lineIndex -lt $lines.Count; $lineIndex++) {
+            if (-not [string]::IsNullOrWhiteSpace($lines[$lineIndex])) { $lastNonEmptyLine = $lineIndex }
+        }
+        $hasTerminalNewline = $content -match "(?:`r?`n)$"
+        for ($lineIndex = 0; $lineIndex -lt $lines.Count; $lineIndex++) {
+            $line = $lines[$lineIndex]
             if (-not [string]::IsNullOrWhiteSpace($line)) {
-                # A concurrently flushed line can be partial; defer it to the
-                # next poll rather than turning it into a synthetic event.
-                try { $events += $line | ConvertFrom-Json -ErrorAction Stop } catch {}
+                try { $events += $line | ConvertFrom-Json -ErrorAction Stop } catch {
+                    # Only an unterminated final line may be concurrently
+                    # flushed. A closed file, or any earlier line, is corrupt.
+                    if (-not $Strict -and $lineIndex -eq $lastNonEmptyLine -and -not $hasTerminalNewline) { continue }
+                    throw "invalid lifecycle JSONL in $($logFile.FullName) at line $($lineIndex + 1): $($_.Exception.Message)"
+                }
             }
         }
     }
@@ -101,10 +115,12 @@ function Start-FrameWeaverdExitCapturedPowerShell {
     $argumentsJson = $ChildArguments | ConvertTo-Json -Compress
     $argumentsBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($argumentsJson))
     $wrapper = Join-Path $PSScriptRoot 'fixtures\run-exit-captured-process.ps1'
-    return Start-Process -FilePath powershell.exe -ArgumentList @(
+    $process = Start-Process -FilePath powershell.exe -ArgumentList @(
         '-NoProfile','-ExecutionPolicy','Bypass','-File',$wrapper,
         '-Executable','powershell.exe','-ArgumentsBase64',$argumentsBase64,'-ExitCodePath',$ExitCodePath
     ) -RedirectStandardOutput $StandardOutputPath -RedirectStandardError $StandardErrorPath -WindowStyle Hidden -PassThru
+    Register-FrameWeaverdOwnedProcess -Process $process | Out-Null
+    return $process
 }
 
 function Get-LoopbackPortObservation {
@@ -183,32 +199,98 @@ function Wait-FrameWeaverdLogEvent {
     throw "expected lifecycle log event was not written; runner=$runner; events=$((Get-TestLogEvents $LogDirectory | ConvertTo-Json -Compress))"
 }
 
+function Register-FrameWeaverdOwnedProcess {
+    param([Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process)
+
+    $process.Refresh()
+    $lease = [pscustomobject]@{
+        Process = $Process
+        Id = $Process.Id
+        StartTimeUtc = $Process.StartTime.ToUniversalTime()
+        Nonce = [guid]::NewGuid().ToString('N')
+    }
+    $script:ownedFrameWeaverdProcesses[[string]$lease.Id] = $lease
+    return $lease
+}
+
+function Register-FrameWeaverdOwnedChildProcess {
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$RunnerProcess,
+        [Parameter(Mandatory = $true)][int]$ChildProcessId
+    )
+
+    $runnerLease = $script:ownedFrameWeaverdProcesses[[string]$RunnerProcess.Id]
+    if (-not $runnerLease -or -not (Test-FrameWeaverdOwnedProcessLease -Lease $runnerLease)) { throw 'runner process is not an owned live fixture process' }
+    $child = Microsoft.PowerShell.Management\Get-Process -Id $ChildProcessId -ErrorAction Stop
+    $childMetadata = CimCmdlets\Get-CimInstance Win32_Process -Filter "ProcessId=$ChildProcessId" -ErrorAction Stop
+    $ancestorId = [int]$childMetadata.ParentProcessId
+    $isRunnerDescendant = $false
+    for ($depth = 0; $depth -lt 8 -and $ancestorId -gt 0; $depth++) {
+        if ($ancestorId -eq $RunnerProcess.Id) { $isRunnerDescendant = $true; break }
+        $ancestor = CimCmdlets\Get-CimInstance Win32_Process -Filter "ProcessId=$ancestorId" -ErrorAction SilentlyContinue
+        if (-not $ancestor) { break }
+        $ancestorId = [int]$ancestor.ParentProcessId
+    }
+    if (-not $isRunnerDescendant) { throw "refusing to own non-descendant process pid=$ChildProcessId" }
+    return Register-FrameWeaverdOwnedProcess -Process $child
+}
+
+function Test-FrameWeaverdOwnedProcessLease {
+    param([Parameter(Mandatory = $true)]$Lease)
+
+    $registered = $script:ownedFrameWeaverdProcesses[[string]$Lease.Id]
+    if (-not $registered -or $registered.Nonce -ne $Lease.Nonce) { return $false }
+    if (-not $Lease.Process -or $Lease.Process.Id -ne $Lease.Id) { return $false }
+    try {
+        $Lease.Process.Refresh()
+        if ($Lease.Process.HasExited) { return $false }
+        $current = Microsoft.PowerShell.Management\Get-Process -Id $Lease.Id -ErrorAction Stop
+        return $current.StartTime.ToUniversalTime().Ticks -eq $Lease.StartTimeUtc.Ticks
+    } catch { return $false }
+}
+
+function Stop-FrameWeaverdOwnedProcess {
+    param([Parameter(Mandatory = $true)]$Lease)
+
+    if (-not (Test-FrameWeaverdOwnedProcessLease -Lease $Lease)) { return $false }
+    try {
+        $Lease.Process.Kill()
+        $Lease.Process.WaitForExit()
+        return $true
+    } catch { return $false }
+}
+
+function Get-FrameWeaverdOwnedDescendantLeases {
+    param([Parameter(Mandatory = $true)]$ParentLease)
+
+    if (-not (Test-FrameWeaverdOwnedProcessLease -Lease $ParentLease)) { return @() }
+    $descendants = @()
+    foreach ($childMetadata in @(CimCmdlets\Get-CimInstance Win32_Process -Filter "ParentProcessId=$($ParentLease.Id)" -ErrorAction SilentlyContinue)) {
+        $child = $null
+        try {
+            $child = Microsoft.PowerShell.Management\Get-Process -Id $childMetadata.ProcessId -ErrorAction Stop
+            $currentMetadata = CimCmdlets\Get-CimInstance Win32_Process -Filter "ProcessId=$($child.Id)" -ErrorAction Stop
+            if ([int]$currentMetadata.ParentProcessId -ne $ParentLease.Id) { continue }
+            $childLease = Register-FrameWeaverdOwnedProcess -Process $child
+            $descendants += Get-FrameWeaverdOwnedDescendantLeases -ParentLease $childLease
+            $descendants += $childLease
+        } catch {}
+    }
+    return $descendants
+}
+
 function Stop-FrameWeaverdTestProcess {
     param([System.Diagnostics.Process]$Process)
 
-    if (-not $Process) { return }
-    $descendants = @()
-    function Get-Descendants([int]$ParentProcessId) {
-        foreach ($child in @(CimCmdlets\Get-CimInstance Win32_Process -Filter "ParentProcessId=$ParentProcessId" -ErrorAction SilentlyContinue)) {
-            Get-Descendants -ParentProcessId $child.ProcessId
-            [int]$child.ProcessId
-        }
+    if (-not $Process) { return $false }
+    $lease = $script:ownedFrameWeaverdProcesses[[string]$Process.Id]
+    if (-not $lease) { return $false }
+    $stopped = $false
+    foreach ($descendantLease in @(Get-FrameWeaverdOwnedDescendantLeases -ParentLease $lease)) {
+        if (Stop-FrameWeaverdOwnedProcess -Lease $descendantLease) { $stopped = $true }
     }
-    $descendants = @(Get-Descendants -ParentProcessId $Process.Id | Select-Object -Unique)
-    foreach ($processId in $descendants) {
-        try {
-            $childProcess = Microsoft.PowerShell.Management\Get-Process -Id $processId -ErrorAction Stop
-            Microsoft.PowerShell.Management\Stop-Process -Id $childProcess.Id -Force -ErrorAction Stop
-            Microsoft.PowerShell.Management\Wait-Process -Id $childProcess.Id -Timeout 10 -ErrorAction SilentlyContinue
-        } catch {}
-    }
-    try {
-        $Process.Refresh()
-        if (-not $Process.HasExited) {
-            Microsoft.PowerShell.Management\Stop-Process -Id $Process.Id -Force -ErrorAction Stop
-        }
-    } catch {}
-    try { Microsoft.PowerShell.Management\Wait-Process -Id $Process.Id -Timeout 10 -ErrorAction SilentlyContinue } catch {}
+    if (Stop-FrameWeaverdOwnedProcess -Lease $lease) { $stopped = $true }
+    return $stopped
 }
 
 Describe 'FrameWeaverd Scheduled Task lifecycle' {
@@ -247,6 +329,44 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
         $message | Should Match 'runner exited'
         $message | Should Match 'fixture-runner-error'
         $message | Should Match '"exit_code":17'
+    }
+
+    It 'does not stop a PID-reuse sentinel without its owned process lease' {
+        $sleeper = Join-Path $repoRoot 'scripts\tests\fixtures\sleep-30.ps1'
+        $sentinel = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$sleeper) -WindowStyle Hidden -PassThru
+        try {
+            $lease = Register-FrameWeaverdOwnedProcess -Process $sentinel
+            $forgedNonceLease = [pscustomobject]@{ Process = $sentinel; Id = $sentinel.Id; StartTimeUtc = $lease.StartTimeUtc; Nonce = [guid]::NewGuid().ToString('N') }
+            $staleStartLease = [pscustomobject]@{ Process = $sentinel; Id = $sentinel.Id; StartTimeUtc = $lease.StartTimeUtc.AddTicks(-1); Nonce = $lease.Nonce }
+
+            (Stop-FrameWeaverdOwnedProcess -Lease $forgedNonceLease) | Should Be $false
+            (Stop-FrameWeaverdOwnedProcess -Lease $staleStartLease) | Should Be $false
+            $sentinel.Refresh()
+            $sentinel.HasExited | Should Be $false
+        } finally {
+            try { if (-not $sentinel.HasExited) { $sentinel.Kill(); $sentinel.WaitForExit() } } catch {}
+        }
+    }
+
+    It 'stops only descendants captured from an owned fixture process handle' {
+        $sleeper = Join-Path $repoRoot 'scripts\tests\fixtures\sleep-30.ps1'
+        $spawner = Join-Path $repoRoot 'scripts\tests\fixtures\spawn-child-and-sleep.ps1'
+        $childPidPath = Join-Path $TestDrive 'owned-child.pid'
+        $root = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$spawner,'-ChildPidPath',$childPidPath,'-ChildScriptPath',$sleeper) -WindowStyle Hidden -PassThru
+        try {
+            Register-FrameWeaverdOwnedProcess -Process $root | Out-Null
+            $deadline = (Get-Date).AddSeconds(5)
+            while (-not (Test-Path -LiteralPath $childPidPath) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }
+            (Test-Path -LiteralPath $childPidPath) | Should Be $true
+            $childPid = [int](Get-Content -LiteralPath $childPidPath -Raw)
+
+            (Stop-FrameWeaverdTestProcess $root) | Should Be $true
+            $root.Refresh()
+            $root.HasExited | Should Be $true
+            (Microsoft.PowerShell.Management\Get-Process -Id $childPid -ErrorAction SilentlyContinue) | Should Be $null
+        } finally {
+            try { if (-not $root.HasExited) { $root.Kill(); $root.WaitForExit() } } catch {}
+        }
     }
 
     It 'renders a non-mutating task definition with the expected restart policy' {
@@ -296,12 +416,36 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
         $blockedLogPath = Join-Path $TestDrive 'initial-sink-is-a-file'
         $markerPath = Join-Path $TestDrive 'daemon-started.marker'
         Set-Content -LiteralPath $blockedLogPath -Value 'not-a-directory'
-        $childArguments = "-NoProfile -Command `"[IO.File]::WriteAllText('$markerPath','started'); Start-Sleep -Seconds 5`""
+        $markerFixture = Join-Path $repoRoot 'scripts\tests\fixtures\write-marker-and-sleep.ps1'
+        $childArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$markerFixture`" -MarkerPath `"$markerPath`""
 
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner -ProjectRoot $repoRoot -BinaryPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -BinaryArguments $childArguments -Port 15176 -HealthTimeoutSeconds 1 -LogDirectory $blockedLogPath
+        $stdoutPath = Join-Path $TestDrive 'initial-sink.stdout.log'
+        $stderrPath = Join-Path $TestDrive 'initial-sink.stderr.log'
+        $exitCodePath = Join-Path $TestDrive 'initial-sink.exitcode'
+        $runnerProcess = Start-FrameWeaverdExitCapturedPowerShell -ChildArguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$runner,'-ProjectRoot',$repoRoot,'-BinaryPath',"$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",'-BinaryArguments',$childArguments,'-Port','15176','-HealthTimeoutSeconds','1','-LogDirectory',$blockedLogPath) -ExitCodePath $exitCodePath -StandardOutputPath $stdoutPath -StandardErrorPath $stderrPath
+        $runnerProcess.WaitForExit()
 
-        $LASTEXITCODE | Should Be 1
+        [int](Get-Content -LiteralPath $exitCodePath -Raw) | Should Be 1
+        (Get-Content -LiteralPath $stderrPath -Raw) | Should Match 'initial lifecycle sink'
         (Test-Path -LiteralPath $markerPath) | Should Be $false
+    }
+
+    It 'passes a marker child argv intact when the initial lifecycle sink is writable' {
+        $logDirectory = Join-Path $TestDrive 'initial-sink-writable'
+        $markerPath = Join-Path $TestDrive 'argv-child-started.marker'
+        $markerFixture = Join-Path $repoRoot 'scripts\tests\fixtures\write-marker-and-sleep.ps1'
+        $childArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$markerFixture`" -MarkerPath `"$markerPath`""
+
+        $stdoutPath = Join-Path $TestDrive 'marker-child.stdout.log'
+        $stderrPath = Join-Path $TestDrive 'marker-child.stderr.log'
+        $exitCodePath = Join-Path $TestDrive 'marker-child.exitcode'
+        $runnerProcess = Start-FrameWeaverdExitCapturedPowerShell -ChildArguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$runner,'-ProjectRoot',$repoRoot,'-BinaryPath',"$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",'-BinaryArguments',$childArguments,'-Port','15174','-HealthTimeoutSeconds','1','-LogDirectory',$logDirectory) -ExitCodePath $exitCodePath -StandardOutputPath $stdoutPath -StandardErrorPath $stderrPath
+        $runnerProcess.WaitForExit()
+
+        [int](Get-Content -LiteralPath $exitCodePath -Raw) | Should Be 1
+        (Test-Path -LiteralPath $markerPath) | Should Be $true
+        (Get-Content -LiteralPath $markerPath -Raw) | Should Be 'started'
+        (Get-Content -LiteralPath $stdoutPath -Raw) | Should Not Match '(?m)^True$'
     }
 
     It 'preserves all lifecycle events across rotation while a cooperative reader holds the old JSONL' {
@@ -320,7 +464,7 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
             $oldReader = [IO.File]::Open($oldLog.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
             $runnerProcess.WaitForExit()
             [int](Get-Content -LiteralPath $exitCodePath -Raw) | Should Be 1
-            $events = @(Get-TestLogEvents $logDirectory)
+            $events = @(Get-TestLogEvents $logDirectory -Strict)
             @($events | Where-Object { $_.event -eq 'starting' }).Count | Should Be 1
             @($events | Where-Object { $_.event -eq 'health_timeout' }).Count | Should Be 1
             @($events | Where-Object { $_.event -eq 'panic_or_exit' }).Count | Should Be 1
@@ -328,6 +472,43 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
         } finally {
             if ($oldReader) { $oldReader.Dispose() }
             Stop-FrameWeaverdTestProcess $runnerProcess
+        }
+    }
+
+    It 'keeps writing to the old sink when rotated sink creation fails' {
+        $logDirectory = Join-Path $TestDrive 'rotation-sink-failure-logs'
+        $sleeper = Join-Path $repoRoot 'scripts\tests\fixtures\sleep-30.ps1'
+        $childArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$sleeper`""
+        $stdoutPath = Join-Path $TestDrive 'rotation-sink-failure.stdout.log'
+        $stderrPath = Join-Path $TestDrive 'rotation-sink-failure.stderr.log'
+        $exitCodePath = Join-Path $TestDrive 'rotation-sink-failure.exitcode'
+        $runnerProcess = Start-FrameWeaverdExitCapturedPowerShell -ChildArguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$runner,'-ProjectRoot',$repoRoot,'-BinaryPath',"$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",'-BinaryArguments',$childArguments,'-Port','15173','-HealthTimeoutSeconds','1','-LogDirectory',$logDirectory,'-TestInitialLogDateKey','20260821','-TestRotatedLogDateKey','20260822','-TestFailRotatedLogSink') -ExitCodePath $exitCodePath -StandardOutputPath $stdoutPath -StandardErrorPath $stderrPath
+        $runnerProcess.WaitForExit()
+
+        [int](Get-Content -LiteralPath $exitCodePath -Raw) | Should Be 1
+        $events = @(Get-TestLogEvents $logDirectory -Strict)
+        @($events | Where-Object { $_.event -eq 'starting' }).Count | Should Be 1
+        @($events | Where-Object { $_.event -eq 'health_timeout' }).Count | Should Be 1
+        @($events | Where-Object { $_.event -eq 'panic_or_exit' }).Count | Should Be 1
+        @(Get-ChildItem -LiteralPath $logDirectory -Filter '*.jsonl').Count | Should Be 1
+        (Get-ChildItem -LiteralPath $logDirectory -Filter '*.jsonl').Name | Should Match '20260821'
+    }
+
+    It 'defers pruning a locked expired frameweaverd log without deleting it' {
+        $logDirectory = Join-Path $TestDrive 'locked-expired-log-prune'
+        New-Item -ItemType Directory -Path $logDirectory | Out-Null
+        $lockedExpired = Join-Path $logDirectory 'frameweaverd-locked-expired.jsonl'
+        Set-Content -LiteralPath $lockedExpired -Value '{"event":"old"}'
+        (Get-Item -LiteralPath $lockedExpired).LastWriteTime = (Get-Date).AddDays(-8)
+        $lock = [IO.File]::Open($lockedExpired, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        $sleeper = Join-Path $repoRoot 'scripts\tests\fixtures\sleep-30.ps1'
+        $childArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$sleeper`""
+        try {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner -ProjectRoot $repoRoot -BinaryPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -BinaryArguments $childArguments -Port 15172 -HealthTimeoutSeconds 1 -LogDirectory $logDirectory
+            $LASTEXITCODE | Should Be 1
+            (Test-Path -LiteralPath $lockedExpired) | Should Be $true
+        } finally {
+            $lock.Dispose()
         }
     }
 
@@ -383,10 +564,11 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
         $previousComfy = $env:FRAMEWEAVER_COMFY_URL
         $previousLocalAppData = $env:LOCALAPPDATA
         $previousShadowAddress = $env:FRAMEWEAVER_SHADOW_COMFY_ADDR
-        $runnerProcess = $null; $shadowProcess = $null; $daemonPid = $null
+        $runnerProcess = $null; $shadowProcess = $null; $daemonProcessLease = $null
         try {
             $env:FRAMEWEAVER_SHADOW_COMFY_ADDR = "127.0.0.1:$shadowPort"
             $shadowProcess = Start-Process -FilePath $shadow -PassThru
+            Register-FrameWeaverdOwnedProcess -Process $shadowProcess | Out-Null
             $deadline = (Get-Date).AddSeconds(10)
             while ((Get-Date) -lt $deadline -and -not (Test-NetConnection 127.0.0.1 -Port $shadowPort -InformationLevel Quiet)) { Start-Sleep -Milliseconds 100 }
             (Test-NetConnection 127.0.0.1 -Port $shadowPort -InformationLevel Quiet) | Should Be $true
@@ -399,7 +581,7 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
             $health.database | Should Be 'ready'
             $ready = @(Wait-FrameWeaverdLogEvent -LogDirectory $logDirectory -Predicate { $_.event -eq 'health_ready' })
             $ready.Count | Should Be 1
-            $daemonPid = [int]$ready[0].pid
+            $daemonProcessLease = Register-FrameWeaverdOwnedChildProcess -RunnerProcess $runnerProcess -ChildProcessId ([int]$ready[0].pid)
 
             $owner = '11111111-1111-4111-8111-111111111111'
             $client = '22222222-2222-4222-8222-222222222222'
@@ -431,7 +613,7 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
             $env:LOCALAPPDATA = $previousLocalAppData
             $env:FRAMEWEAVER_SHADOW_COMFY_ADDR = $previousShadowAddress
             if ($runnerProcess) { Stop-FrameWeaverdTestProcess $runnerProcess }
-            if ($daemonPid) { Stop-FrameWeaverdTestProcess (Microsoft.PowerShell.Management\Get-Process -Id $daemonPid -ErrorAction SilentlyContinue) }
+            if ($daemonProcessLease) { Stop-FrameWeaverdOwnedProcess -Lease $daemonProcessLease | Out-Null }
             if ($shadowProcess) { Stop-FrameWeaverdTestProcess $shadowProcess }
         }
     }
@@ -450,10 +632,11 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
         $previousComfy = $env:FRAMEWEAVER_COMFY_URL
         $previousLocalAppData = $env:LOCALAPPDATA
         $previousShadowAddress = $env:FRAMEWEAVER_SHADOW_COMFY_ADDR
-        $runnerProcess = $null; $shadowProcess = $null; $firstDaemonPid = $null; $secondDaemonPid = $null; $logReadLock = $null; $incompatibleReaderError = $null
+        $runnerProcess = $null; $shadowProcess = $null; $firstDaemonPid = $null; $secondDaemonPid = $null; $firstDaemonLease = $null; $secondDaemonLease = $null; $logReadLock = $null; $incompatibleReaderError = $null
         try {
             $env:FRAMEWEAVER_SHADOW_COMFY_ADDR = "127.0.0.1:$shadowPort"
             $shadowProcess = Start-Process -FilePath $shadow -PassThru
+            Register-FrameWeaverdOwnedProcess -Process $shadowProcess | Out-Null
             $deadline = (Get-Date).AddSeconds(10)
             while ((Get-Date) -lt $deadline -and -not (Test-NetConnection 127.0.0.1 -Port $shadowPort -InformationLevel Quiet)) { Start-Sleep -Milliseconds 100 }
 
@@ -463,6 +646,7 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
             Wait-FrameWeaverdHealth -Uri "http://127.0.0.1:$daemonPort/api/health" -RunnerProcess $runnerProcess -LogDirectory $logDirectory | Out-Null
             $firstReady = @(Wait-FrameWeaverdLogEvent -LogDirectory $logDirectory -Predicate { $_.event -eq 'health_ready' } | Select-Object -Last 1)
             $firstDaemonPid = [int]$firstReady[0].pid
+            $firstDaemonLease = Register-FrameWeaverdOwnedChildProcess -RunnerProcess $runnerProcess -ChildProcessId $firstDaemonPid
 
             # A cooperative tailer permits the runner's already-owned writer.
             $logFile = Get-ChildItem -LiteralPath $logDirectory -Filter '*.jsonl' | Select-Object -Last 1
@@ -474,9 +658,10 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
             }
             $incompatibleReaderError | Should Not Be $null
 
-            Microsoft.PowerShell.Management\Stop-Process -Id $firstDaemonPid -Force
+            (Stop-FrameWeaverdOwnedProcess -Lease $firstDaemonLease) | Should Be $true
             $secondReady = @(Wait-FrameWeaverdLogEvent -LogDirectory $logDirectory -Predicate { $_.event -eq 'health_ready' -and [int]$_.pid -ne $firstDaemonPid } -TimeoutSeconds 15 -RunnerProcess $runnerProcess -RunnerStandardOutputPath $runnerStdoutPath -RunnerStandardErrorPath $runnerStderrPath -RunnerExitCodePath $runnerExitCodePath)
             $secondDaemonPid = [int]$secondReady[0].pid
+            $secondDaemonLease = Register-FrameWeaverdOwnedChildProcess -RunnerProcess $runnerProcess -ChildProcessId $secondDaemonPid
             Wait-FrameWeaverdHealth -Uri "http://127.0.0.1:$daemonPort/api/health" -RunnerProcess $runnerProcess -LogDirectory $logDirectory | Out-Null
 
             $runnerProcess.Refresh()
@@ -500,8 +685,8 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
             $env:FRAMEWEAVER_SHADOW_COMFY_ADDR = $previousShadowAddress
             if ($logReadLock) { $logReadLock.Dispose() }
             if ($runnerProcess) { Stop-FrameWeaverdTestProcess $runnerProcess }
-            if ($firstDaemonPid) { Stop-FrameWeaverdTestProcess (Microsoft.PowerShell.Management\Get-Process -Id $firstDaemonPid -ErrorAction SilentlyContinue) }
-            if ($secondDaemonPid) { Stop-FrameWeaverdTestProcess (Microsoft.PowerShell.Management\Get-Process -Id $secondDaemonPid -ErrorAction SilentlyContinue) }
+            if ($firstDaemonLease) { Stop-FrameWeaverdOwnedProcess -Lease $firstDaemonLease | Out-Null }
+            if ($secondDaemonLease) { Stop-FrameWeaverdOwnedProcess -Lease $secondDaemonLease | Out-Null }
             if ($shadowProcess) { Stop-FrameWeaverdTestProcess $shadowProcess }
         }
     }
