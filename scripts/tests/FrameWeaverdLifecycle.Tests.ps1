@@ -18,7 +18,22 @@ function Get-TestLogEvents {
     $logFile = Get-ChildItem -LiteralPath $LogDirectory -Filter '*.jsonl' -ErrorAction SilentlyContinue | Select-Object -Last 1
     if (-not $logFile) { return @() }
     $events = @()
-    foreach ($line in Get-Content -LiteralPath $logFile.FullName -ErrorAction SilentlyContinue) {
+    $stream = $null
+    $reader = $null
+    try {
+        # The runner appends JSONL while this fixture polls.  Get-Content opens
+        # a reader that can transiently deny that append on Windows, so permit
+        # a concurrent writer explicitly.
+        $stream = [IO.File]::Open($logFile.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $true)
+        $lines = @($reader.ReadToEnd() -split "`r?`n")
+    } catch {
+        return @()
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+    foreach ($line in $lines) {
         if (-not [string]::IsNullOrWhiteSpace($line)) {
             try { $events += $line | ConvertFrom-Json -ErrorAction Stop } catch {}
         }
@@ -89,6 +104,21 @@ function Start-FrameWeaverdExitCapturedPowerShell {
         '-NoProfile','-ExecutionPolicy','Bypass','-File',$wrapper,
         '-Executable','powershell.exe','-ArgumentsBase64',$argumentsBase64,'-ExitCodePath',$ExitCodePath
     ) -RedirectStandardOutput $StandardOutputPath -RedirectStandardError $StandardErrorPath -WindowStyle Hidden -PassThru
+}
+
+function Get-LoopbackPortObservation {
+    param([int]$Port)
+
+    $listeners = @(
+        Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
+            Where-Object { $_.LocalAddress -eq '127.0.0.1' } |
+            Select-Object LocalAddress, LocalPort, OwningProcess
+    )
+    return [pscustomobject]@{
+        observed_at = (Get-Date).ToUniversalTime().ToString('o')
+        port = $Port
+        listeners = $listeners
+    }
 }
 
 function Wait-FrameWeaverdHealth {
@@ -307,6 +337,9 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
         $runId = [guid]::NewGuid().ToString('N')
         $logDirectory = Join-Path $TestDrive "production-structured-logs-$runId"
         $dataDirectory = Join-Path $TestDrive "production-localappdata-$runId"
+        $runnerStdoutPath = Join-Path $TestDrive "production-runner-$runId.stdout.log"
+        $runnerStderrPath = Join-Path $TestDrive "production-runner-$runId.stderr.log"
+        $runnerExitCodePath = Join-Path $TestDrive "production-runner-$runId.exitcode"
         $previousComfy = $env:FRAMEWEAVER_COMFY_URL
         $previousLocalAppData = $env:LOCALAPPDATA
         $previousShadowAddress = $env:FRAMEWEAVER_SHADOW_COMFY_ADDR
@@ -320,7 +353,7 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
 
             $env:FRAMEWEAVER_COMFY_URL = "http://127.0.0.1:$shadowPort"
             $env:LOCALAPPDATA = $dataDirectory
-            $runnerProcess = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$runner,'-ProjectRoot',$repoRoot,'-BinaryPath',$daemon,'-Port',$daemonPort,'-HealthTimeoutSeconds','10','-LogDirectory',$logDirectory) -PassThru
+            $runnerProcess = Start-FrameWeaverdExitCapturedPowerShell -ChildArguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$runner,'-ProjectRoot',$repoRoot,'-BinaryPath',$daemon,'-Port',$daemonPort,'-HealthTimeoutSeconds','10','-LogDirectory',$logDirectory) -ExitCodePath $runnerExitCodePath -StandardOutputPath $runnerStdoutPath -StandardErrorPath $runnerStderrPath
             $health = Wait-FrameWeaverdHealth -Uri "http://127.0.0.1:$daemonPort/api/health" -RunnerProcess $runnerProcess -LogDirectory $logDirectory
             $health.service | Should Be 'ready'
             $health.database | Should Be 'ready'
@@ -331,7 +364,21 @@ Describe 'FrameWeaverd Scheduled Task lifecycle' {
             $owner = '11111111-1111-4111-8111-111111111111'
             $client = '22222222-2222-4222-8222-222222222222'
             $payload = @{ client_id = $client; kind = 'image'; mode = 'test'; prompt = 'test'; settings = @{}; workflow = @{} } | ConvertTo-Json -Compress
-            Microsoft.PowerShell.Utility\Invoke-WebRequest -Uri "http://127.0.0.1:$daemonPort/api/jobs" -Method Post -ContentType 'application/json' -Headers @{ 'X-FrameWeaver-Owner' = $owner } -Body $payload -UseBasicParsing | Out-Null
+            $beforePost = [pscustomobject]@{
+                runner = Get-FrameWeaverdRunnerObservation -RunnerProcess $runnerProcess -StandardOutputPath $runnerStdoutPath -StandardErrorPath $runnerStderrPath -ExitCodePath $runnerExitCodePath
+                port = Get-LoopbackPortObservation -Port $daemonPort
+                events = Get-TestLogEvents $logDirectory
+            }
+            try {
+                Microsoft.PowerShell.Utility\Invoke-WebRequest -Uri "http://127.0.0.1:$daemonPort/api/jobs" -Method Post -ContentType 'application/json' -Headers @{ 'X-FrameWeaver-Owner' = $owner } -Body $payload -UseBasicParsing | Out-Null
+            } catch {
+                $afterPost = [pscustomobject]@{
+                    runner = Get-FrameWeaverdRunnerObservation -RunnerProcess $runnerProcess -StandardOutputPath $runnerStdoutPath -StandardErrorPath $runnerStderrPath -ExitCodePath $runnerExitCodePath
+                    port = Get-LoopbackPortObservation -Port $daemonPort
+                    events = Get-TestLogEvents $logDirectory
+                }
+                throw "job submit POST failed; before=$($beforePost | ConvertTo-Json -Compress -Depth 5); after=$($afterPost | ConvertTo-Json -Compress -Depth 5); original=$($_.Exception.Message)"
+            }
             $structured = @(Wait-FrameWeaverdLogEvent -LogDirectory $logDirectory -Predicate { $_.event -eq 'job_submit' -and $_.result -eq 'submitted' })
             $structured.Count | Should Be 1
             foreach ($field in 'event','job_id','owner_short','from','to','result','duration_ms') { ($structured[0].PSObject.Properties.Name -contains $field) | Should Be $true }
