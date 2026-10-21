@@ -177,3 +177,25 @@ describe('persisted job reconciliation', () => {
     expect(useGenerationStore.getState().currentPromptId).toBeNull()
   })
 })
+
+
+it('coalesces simultaneous manual capability refreshes', async () => {
+  let release!: (response: Response) => void
+  let statsCalls = 0
+  vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/system_stats')) {
+      statsCalls++
+      return new Promise<Response>((resolve) => { release = resolve })
+    }
+    const className = url.split('/').at(-1) ?? ''
+    const fields: Record<string, string> = { CheckpointLoaderSimple: 'ckpt_name', UNETLoader: 'unet_name', CLIPLoader: 'clip_name', VAELoader: 'vae_name', LoraLoaderModelOnly: 'lora_name' }
+    return Response.json({ [className]: { input: { required: { [fields[className]]: [[]] } } } })
+  })
+  const first = useGenerationStore.getState().refreshCapability()
+  const second = useGenerationStore.getState().refreshCapability()
+  expect(statsCalls).toBe(1)
+  release(Response.json({ devices: [{ name: 'Fixture', type: 'cuda', vram_total: 8000, vram_free: 7000 }] }))
+  await Promise.all([first, second])
+  expect(useGenerationStore.getState().capability?.status).toBe('ready')
+})
