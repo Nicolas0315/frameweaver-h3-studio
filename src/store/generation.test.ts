@@ -32,10 +32,13 @@ beforeAll(async () => {
   vi.stubGlobal('localStorage', fakeLocalStorage)
   vi.stubGlobal('WebSocket', FakeWebSocket)
   vi.stubGlobal('location', { origin: 'http://localhost:5180' })
+  vi.stubGlobal('fetch', async () => new Response(null, { status: 503 }))
   // リロード前に保存されていた下書き
   storageMap.set('frameweaver-draft-video-prompt', 'saved video draft')
   storageMap.set('frameweaver-draft-image-prompt', 'saved image draft')
   store = await import('./generation')
+  await Promise.resolve()
+  await Promise.resolve()
 })
 
 describe('プロンプト下書きの永続化(store配線)', () => {
@@ -62,9 +65,13 @@ describe('プロンプト下書きの永続化(store配線)', () => {
 })
 
 describe('ComfyUI接続状態の分離', () => {
-  it('REST能力とWebSocketイベント経路を別々に表示できる', () => {
+  it('REST能力とWebSocketイベント経路を別々に表示できる', async () => {
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => String(input).endsWith('/system_stats')
+      ? Response.json({ devices: [{ name: 'Fixture GPU', type: 'cuda', vram_total: 8000, vram_free: 7000 }] })
+      : Response.json({}))
     store.useGenerationStore.setState({ connected: true, wsConnected: false })
     FakeWebSocket.latest?.onopen?.()
+    await store.useGenerationStore.getState().refreshCapability()
     expect(store.useGenerationStore.getState()).toMatchObject({ connected: true, wsConnected: true })
 
     FakeWebSocket.latest?.onclose?.()
@@ -194,4 +201,26 @@ describe('ノード能力のストア配線', () => {
     expect(state.capability?.status).toBe('unavailable')
     expect(state.connected).toBe(false)
   })
+})
+
+
+it('coalesces simultaneous manual capability refreshes', async () => {
+  let release!: (response: Response) => void
+  let statsCalls = 0
+  vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/system_stats')) {
+      statsCalls++
+      return new Promise<Response>((resolve) => { release = resolve })
+    }
+    const className = url.split('/').at(-1) ?? ''
+    const fields: Record<string, string> = { CheckpointLoaderSimple: 'ckpt_name', UNETLoader: 'unet_name', CLIPLoader: 'clip_name', VAELoader: 'vae_name', LoraLoaderModelOnly: 'lora_name' }
+    return Response.json({ [className]: { input: { required: { [fields[className]]: [[]] } } } })
+  })
+  const first = store.useGenerationStore.getState().refreshCapability()
+  const second = store.useGenerationStore.getState().refreshCapability()
+  expect(statsCalls).toBe(1)
+  release(Response.json({ devices: [{ name: 'Fixture', type: 'cuda', vram_total: 8000, vram_free: 7000 }] }))
+  await Promise.all([first, second])
+  expect(store.useGenerationStore.getState().capability?.status).toBe('ready')
 })
