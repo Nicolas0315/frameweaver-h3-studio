@@ -53,7 +53,7 @@ export function ImageStudio() {
   const ready = !busy && imageParams.prompt.trim().length > 0
   const isAnime = imageParams.model === 'anime'
   const canRewrite = imageRewriterAvailable && imageRewriterSupports(imageParams.model)
-  const modelFits = capability ? rankModels(capability, 'image') : []
+  const modelFits = capability ? rankModels(capability, 'image', imageParams.animeCheckpoint) : []
 
   // 選択中LoRAの説明(Civitai由来)。ComfyUIはWindowsで "\" 区切り、メタキーは "/" なので正規化
   const metaOf = (name: string) => loraMeta[name.trim().replace(/\\/g, '/')]

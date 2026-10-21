@@ -103,3 +103,44 @@ fn rejects_unknown_stale_role_and_vram_shortage() {
         RoutingError::NoEligibleWorker
     );
 }
+
+#[tokio::test]
+async fn production_local_fallback_uses_comfy_metrics_and_fails_closed() {
+    use axum::{Json, Router, routing::get};
+    use frameweaverd::{comfy::ComfyApi, workers::WorkerRegistry};
+    use serde_json::json;
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route(
+            "/system_stats",
+            get(|| async { Json(json!({"devices":[{"vram_free":20_000_u64 * 1024 * 1024}]})) }),
+        )
+        .route(
+            "/queue",
+            get(|| async { Json(json!({"queue_running":[{}],"queue_pending":[{},{}]})) }),
+        );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let registry = WorkerRegistry::local_probed(
+        ComfyApi::new(format!("http://{address}").parse().unwrap()).unwrap(),
+    );
+    let snapshots = registry.snapshots().await;
+    assert_eq!(snapshots[0].free_vram_mb, 20_000);
+    assert_eq!(snapshots[0].queue_depth, 3);
+    assert!(snapshots[0].online);
+    server.abort();
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = closed.local_addr().unwrap();
+    drop(closed);
+    let offline = WorkerRegistry::local_probed(
+        ComfyApi::new(format!("http://{address}").parse().unwrap()).unwrap(),
+    )
+    .snapshots()
+    .await;
+    assert!(!offline[0].online);
+    assert!(offline[0].stale);
+    assert_eq!(offline[0].free_vram_mb, 0);
+}

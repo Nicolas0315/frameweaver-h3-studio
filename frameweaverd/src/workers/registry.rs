@@ -57,12 +57,18 @@ impl WorkerRegistry {
         registry
     }
 
+    pub fn local_probed(client: ComfyApi) -> Self {
+        let mut registry = Self::local(client);
+        registry.probe = true;
+        registry
+    }
+
     pub fn from_env_or_local(local: ComfyApi) -> Result<Self, String> {
         let Some(raw) = std::env::var("FRAMEWEAVER_WORKERS_JSON")
             .ok()
             .filter(|value| !value.trim().is_empty())
         else {
-            return Ok(Self::local(local));
+            return Ok(Self::local_probed(local));
         };
         let definitions: Vec<WorkerDefinition> =
             serde_json::from_str(&raw).map_err(|_| "FRAMEWEAVER_WORKERS_JSON is invalid")?;

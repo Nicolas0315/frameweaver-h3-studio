@@ -226,6 +226,9 @@ export function imageSlots(mode: GenerationMode): [number, number] {
   }
 }
 
+let capabilityRefreshInFlight: Promise<void> | null = null
+let lastCapabilityAttempt = 0
+
 export const useGenerationStore = create<GenerationState>((set, get) => ({
   workerPreference: { mode: 'auto' },
   setWorkerPreference: (workerPreference) => set({ workerPreference, pendingRequestId: null }),
@@ -455,19 +458,21 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
     set({ loraMeta, loraList })
   },
 
-  refreshCapability: async () => {
-    const capability = await client.capabilities()
-    const primary = capability.devices.reduce<(typeof capability.devices)[number] | null>(
-      (best, device) => !best || device.vramTotal > best.vramTotal ? device : best,
-      null,
-    )
-    set({
-      capability,
-      connected: capability.status === 'ready' || capability.status === 'degraded',
-      ...(primary ? { vram: { total: primary.vramTotal, free: primary.vramFree } } : {}),
-      checkpointList: capability.inventory.checkpoints,
-      loraList: capability.inventory.loras,
-    })
+  refreshCapability: () => {
+    if (capabilityRefreshInFlight) return capabilityRefreshInFlight
+    lastCapabilityAttempt = Date.now()
+    capabilityRefreshInFlight = (async () => {
+      const capability = await client.capabilities()
+      const primary = capability.devices[0]
+      set({
+        capability,
+        connected: capability.status === 'ready' || capability.status === 'degraded',
+        ...(primary ? { vram: { total: primary.vramTotal, free: primary.vramFree } } : {}),
+        checkpointList: capability.inventory.checkpoints,
+        loraList: capability.inventory.loras,
+      })
+    })().finally(() => { capabilityRefreshInFlight = null })
+    return capabilityRefreshInFlight
   },
 
   applyLoraFromCatalog: (metaKey) => {
@@ -543,6 +548,8 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
       })
       client.connect(job.id)
       set({ currentPromptId: job.id, pendingRequestId: null })
+      applyPersistedJob(job)
+      activeJobPoller.wake()
     } catch (e) {
       set({ status: 'error', error: e instanceof Error ? e.message : String(e), pendingRequestId: e instanceof FrameWeaverApiError && e.status < 500 ? null : requestId })
     }
@@ -706,6 +713,8 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
       })
       client.connect(job.id)
       set({ currentPromptId: job.id, pendingRequestId: null })
+      applyPersistedJob(job)
+      activeJobPoller.wake()
     } catch (e) {
       set({ status: 'error', error: e instanceof Error ? e.message : String(e), pendingRequestId: e instanceof FrameWeaverApiError && e.status < 500 ? null : requestId })
     }
@@ -728,55 +737,63 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
 
 }))
 
+export function applyPersistedJob(job: FrameWeaverJob): void {
+  const state = useGenerationStore.getState()
+  if (state.currentPromptId !== job.id) return
+  if (job.status === 'succeeded') {
+    const item = historyFromJob(job)
+    useGenerationStore.setState({
+      status: item.videoUrl ? 'done' : 'error',
+      error: item.videoUrl ? null : '出力ファイルが見つかりませんでした',
+      videoUrl: item.videoUrl,
+      currentPromptId: null,
+      progress: null,
+      resultKind: job.kind,
+      history: [item, ...state.history.filter((previous) => previous.promptId !== job.id)],
+    })
+  } else if (job.status === 'failed' || job.status === 'orphaned' || job.status === 'cancelled') {
+    useGenerationStore.setState({
+      status: job.status === 'cancelled' ? 'idle' : 'error',
+      error: job.status === 'cancelled' ? null : job.error ?? 'ジョブが中断されました',
+      currentPromptId: null,
+      progress: null,
+    })
+  } else {
+    useGenerationStore.setState({ status: job.status === 'queued' ? 'queued' : 'running', error: null })
+  }
+}
+
+const jobRefreshes = new Map<string, Promise<void>>()
+async function reconcileActiveJob(promptId: string): Promise<void> {
+  const pending = jobRefreshes.get(promptId)
+  if (pending) return pending
+  const request = frameWeaverApi.getJob(promptId).then(applyPersistedJob).catch((error: unknown) => {
+    if (useGenerationStore.getState().currentPromptId === promptId) {
+      useGenerationStore.setState({ error: error instanceof Error ? error.message : 'ジョブ状態を再取得できません' })
+    }
+  }).finally(() => { jobRefreshes.delete(promptId) })
+  jobRefreshes.set(promptId, request)
+  return request
+}
+
 async function handleDone(promptId: string) {
-  const outputs = await client.fetchOutputs(promptId)
-  const { params, imageParams, history, currentKind } = useGenerationStore.getState()
-  const output =
-    currentKind === 'video'
-      ? (outputs.find((o) => /\.(mp4|webm|mov)$/i.test(o.filename)) ?? outputs[0])
-      : (outputs.find((o) => /\.(png|jpe?g|webp)$/i.test(o.filename)) ?? outputs[0])
-  if (!output) {
-    useGenerationStore.setState({ status: 'error', error: '出力ファイルが見つかりませんでした' })
-    return
-  }
-  const url = client.viewUrl(output, promptId)
-  const item: HistoryItem = {
-    promptId,
-    kind: currentKind,
-    mode: currentKind === 'video' ? params.mode : imageParams.model,
-    prompt: currentKind === 'video' ? params.prompt : imageParams.prompt,
-    nsfw: currentKind === 'video' ? params.nsfw : false,
-    videoUrl: url,
-    filename: output.filename,
-    createdAt: new Date().toISOString(),
-    settings:
-      currentKind === 'video'
-        ? {
-            width: params.width,
-            height: params.height,
-            steps: params.steps,
-            seed: params.seed,
-            extraLora: params.extraLora,
-            extraLoraStrength: params.extraLoraStrength,
-            lengthSec: params.lengthSec,
-            turbo: params.turbo,
-          }
-        : {
-            width: imageParams.width,
-            height: imageParams.height,
-            steps: imageParams.steps,
-            seed: imageParams.seed,
-            extraLora: imageParams.extraLora,
-            extraLoraStrength: imageParams.extraLoraStrength,
-          },
-  }
-  useGenerationStore.setState({
-    status: 'done',
-    videoUrl: url,
-    resultKind: currentKind,
-    history: [item, ...history.filter((existing) => existing.promptId !== promptId)],
-    progress: null,
-  })
+  // Reconciliation persists output ownership before a media URL becomes visible.
+  await reconcileActiveJob(promptId)
+}
+
+let resourceInitialization: Promise<void> | null = null
+function initializeResources(): Promise<void> {
+  if (resourceInitialization) return resourceInitialization
+  const imageModel = useGenerationStore.getState().imageParams.model
+  resourceInitialization = Promise.all([
+    useGenerationStore.getState().refreshCapability(),
+    client.getLoraMeta().then((loraMeta) => useGenerationStore.setState({ loraMeta })),
+    rewriterInstalled().then((ok) => useGenerationStore.setState({ rewriterAvailable: ok })),
+    imageRewriterInstalled(imageModel).then((ok) => {
+      if (useGenerationStore.getState().imageParams.model === imageModel) useGenerationStore.setState({ imageRewriterAvailable: ok })
+    }),
+  ]).then(() => undefined).finally(() => { resourceInitialization = null })
+  return resourceInitialization
 }
 
 // WebSocketイベント → ストア反映
@@ -786,15 +803,7 @@ client.onEvent((ev) => {
     case 'status':
       if (ev.message === 'connected') {
         useGenerationStore.setState({ wsConnected: true })
-        void useGenerationStore.getState().refreshCapability()
-        void client.getLoraMeta().then((loraMeta) => useGenerationStore.setState({ loraMeta }))
-        void rewriterInstalled().then((ok) => useGenerationStore.setState({ rewriterAvailable: ok }))
-        const imageModel = useGenerationStore.getState().imageParams.model
-        void imageRewriterInstalled(imageModel).then((ok) => {
-          if (useGenerationStore.getState().imageParams.model === imageModel) {
-            useGenerationStore.setState({ imageRewriterAvailable: ok })
-          }
-        })
+        if (state.currentPromptId) void reconcileActiveJob(state.currentPromptId)
       }
       if (ev.message === 'disconnected') useGenerationStore.setState({ wsConnected: false })
       if (ev.queueRemaining !== undefined) useGenerationStore.setState({ queueRemaining: ev.queueRemaining })
@@ -828,7 +837,7 @@ client.onEvent((ev) => {
   }
 })
 
-client.connect()
+void initializeResources()
 
 // プロンプト下書きの永続化(リロードしても消えないように変更のたび保存)
 useGenerationStore.subscribe((s, prev) => {
@@ -851,10 +860,18 @@ useGenerationStore.subscribe((s, prev) => {
 })
 
 // VRAMだけを軽量監視。モデル在庫は接続時または手動更新時に取得する。
+let restWasAvailable = false
 const vramPoller = createAdaptivePoller({
   poll: async () => {
     const stats = await client.systemStats()
     if (stats) {
+      const capability = useGenerationStore.getState().capability
+      const recovered = !restWasAvailable
+      restWasAvailable = true
+      if (recovered) void initializeResources()
+      if (!capability || recovered || (capability.status !== 'ready' && Date.now() - lastCapabilityAttempt >= 30_000)) {
+        await useGenerationStore.getState().refreshCapability()
+      }
       useGenerationStore.setState((state) => ({
         vram: { total: stats.vramTotal, free: stats.vramFree },
         connected: true,
@@ -862,7 +879,7 @@ const vramPoller = createAdaptivePoller({
           ? {
               ...state.capability,
               capturedAt: new Date().toISOString(),
-              status: state.capability.errors.length > 0 ? 'degraded' : 'ready',
+              status: state.capability.status === 'unavailable' ? 'unavailable' : state.capability.errors.length > 0 ? 'degraded' : 'ready',
               devices: state.capability.devices.length > 0
                 ? state.capability.devices.map((device, index) => index === 0
                     ? { ...device, vramTotal: stats.vramTotal, vramFree: stats.vramFree }
@@ -873,6 +890,7 @@ const vramPoller = createAdaptivePoller({
       }))
       return
     }
+    restWasAvailable = false
     useGenerationStore.setState((state) => ({
       connected: false,
       capability: state.capability ? { ...state.capability, status: 'stale' } : null,
@@ -893,3 +911,20 @@ void frameWeaverApi.listJobs()
   .catch(() => {
     // API が一時的に利用できない間だけ、初期化時に読んだ旧履歴を表示し続ける。
   })
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => vramPoller.wake())
+}
+useGenerationStore.subscribe((state, previous) => {
+  if (state.status !== previous.status) vramPoller.wake()
+})
+
+const activeJobPoller = createAdaptivePoller({
+  poll: async () => {
+    const promptId = useGenerationStore.getState().currentPromptId
+    if (promptId) await reconcileActiveJob(promptId)
+  },
+  delay: () => pollDelay(useGenerationStore.getState().status, typeof document === 'undefined' ? 'visible' : document.visibilityState),
+})
+activeJobPoller.start()
+if (typeof document !== 'undefined') document.addEventListener('visibilitychange', () => activeJobPoller.wake())

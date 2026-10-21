@@ -32,7 +32,12 @@ const environment = vi.hoisted(() => {
   return { fetch }
 })
 
-import { historyFromJob, useGenerationStore } from './generation'
+vi.mock('../lib/adaptive-poller', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/adaptive-poller')>()
+  return { ...actual, createAdaptivePoller: () => ({ start() {}, stop() {}, wake() {}, trigger: async () => {} }) }
+})
+
+import { applyPersistedJob, historyFromJob, useGenerationStore } from './generation'
 
 const completedJob = {
   id: '22222222-2222-4222-8222-222222222222',
@@ -56,7 +61,7 @@ describe('generation store API history integration', () => {
       expect(useGenerationStore.getState().history).toEqual([expect.objectContaining({
         promptId: completedJob.id,
         filename: 'result.png',
-        videoUrl: 'http://127.0.0.1:8188/comfy/view?filename=result.png&subfolder=images&type=output&prompt_id=22222222-2222-4222-8222-222222222222',
+        videoUrl: 'http://127.0.0.1:8188/comfy/view?filename=result.png&subfolder=images&type=output&prompt_id=22222222-2222-4222-8222-222222222222&owner=11111111-1111-4111-8111-111111111111',
       })])
     })
     expect(historyFromJob(completedJob)).toEqual(expect.objectContaining({ filename: 'result.png' }))
@@ -144,5 +149,31 @@ describe('非同期プロンプト強化の競合防止', () => {
     expect(useGenerationStore.getState().params.prompt).toBe('edited while waiting')
     expect(useGenerationStore.getState().rewriteUndo).toBeNull()
     expect(useGenerationStore.getState().rewriting).toBe(false)
+  })
+})
+
+
+describe('persisted job reconciliation', () => {
+  it('finishes a completed replay without waiting for a future websocket event', () => {
+    useGenerationStore.setState({ currentPromptId: completedJob.id, status: 'queued', history: [] })
+    applyPersistedJob(completedJob)
+    const state = useGenerationStore.getState()
+    expect(state.status).toBe('done')
+    expect(state.currentPromptId).toBeNull()
+    expect(state.videoUrl).toContain(`prompt_id=${completedJob.id}`)
+    expect(state.videoUrl).toContain('owner=11111111-1111-4111-8111-111111111111')
+    expect(state.history[0].promptId).toBe(completedJob.id)
+  })
+  it('ignores completion from a previously active job', () => {
+    useGenerationStore.setState({ currentPromptId: 'other-job', status: 'running' })
+    applyPersistedJob(completedJob)
+    expect(useGenerationStore.getState().currentPromptId).toBe('other-job')
+    expect(useGenerationStore.getState().status).toBe('running')
+  })
+  it('converges confirmed cancellation without keeping the UI busy', () => {
+    useGenerationStore.setState({ currentPromptId: completedJob.id, status: 'running' })
+    applyPersistedJob({ ...completedJob, status: 'cancelled' })
+    expect(useGenerationStore.getState().status).toBe('idle')
+    expect(useGenerationStore.getState().currentPromptId).toBeNull()
   })
 })

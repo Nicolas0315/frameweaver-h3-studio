@@ -108,7 +108,7 @@ export const MODEL_CATALOG: readonly ModelCatalogEntry[] = [
     requiredFiles: {
       unets: ['minimax_h3_fl2va_pruned_int8_convrot.safetensors'],
       clips: ['qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors'],
-      vaes: ['minimax_h3_video_vae_fp16.safetensors'],
+      vaes: ['minimax_h3_video_vae_fp16.safetensors', 'minimax_h3_audio_vae_fp32.safetensors'],
     },
   },
 ]
@@ -120,10 +120,10 @@ export function normalizeModelPath(value: string): string {
 function missingRequiredFiles(model: ModelCatalogEntry, inventory: ModelInventory): string[] {
   const missing: string[] = []
   for (const [kind, required] of Object.entries(model.requiredFiles) as [InventoryKind, string[]][]) {
-    const available = inventory[kind].map(normalizeModelPath)
+    const available = inventory[kind].map((entry) => entry.replace(/\\/g, '/'))
     for (const filename of required) {
-      const wanted = normalizeModelPath(filename)
-      if (!available.some((entry) => entry === wanted || entry.endsWith(`/${wanted}`))) missing.push(filename)
+      const wanted = filename.replace(/\\/g, '/')
+      if (!available.includes(wanted)) missing.push(filename)
     }
   }
   return missing
@@ -131,10 +131,7 @@ function missingRequiredFiles(model: ModelCatalogEntry, inventory: ModelInventor
 
 function fitModel(snapshot: NodeCapabilitySnapshot, model: ModelCatalogEntry): ModelFit {
   const missingFiles = missingRequiredFiles(model, snapshot.inventory)
-  const primary = snapshot.devices.reduce<CapabilityDevice | null>(
-    (best, device) => !best || device.vramTotal > best.vramTotal ? device : best,
-    null,
-  )
+  const primary = snapshot.devices[0]
   const reasons: ModelFitReason[] = []
 
   if (snapshot.status === 'unavailable') reasons.push('capability-unavailable')
@@ -161,10 +158,12 @@ const STATUS_ORDER: Record<ModelFitStatus, number> = {
   unavailable: 3,
 }
 
-export function rankModels(snapshot: NodeCapabilitySnapshot, task: ModelTask): ModelFit[] {
+export function rankModels(snapshot: NodeCapabilitySnapshot, task: ModelTask, animeCheckpoint?: string): ModelFit[] {
   return MODEL_CATALOG
     .filter((model) => model.task === task)
-    .map((model, index) => ({ fit: fitModel(snapshot, model), index }))
+    .map((model, index) => ({ fit: fitModel(snapshot, model.id === 'anime' && animeCheckpoint
+      ? { ...model, requiredFiles: { checkpoints: [animeCheckpoint] } }
+      : model), index }))
     .sort((left, right) => STATUS_ORDER[left.fit.status] - STATUS_ORDER[right.fit.status] || left.index - right.index)
     .map(({ fit }) => fit)
 }

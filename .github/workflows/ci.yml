@@ -30,31 +30,43 @@ jobs:
       - name: Frontend unit, lint, and build
         run: |
           npm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm run docs:verify
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm run lint
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm audit --audit-level=high
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Browser E2E
         run: |
           npx playwright install chromium
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm run test:e2e
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Rust checks
         working-directory: frameweaverd
         run: |
           cargo fmt --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Rust advisory audit
         working-directory: frameweaverd
         shell: pwsh
         run: |
           cargo install cargo-audit --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # SQLx's macro metadata locks an unused MySQL/RSA package. `cargo tree -i rsa`
           # is empty for every build target; RUSTSEC-2023-0071 has no patched release.
           cargo audit --ignore RUSTSEC-2023-0071
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: PowerShell contracts
         shell: powershell

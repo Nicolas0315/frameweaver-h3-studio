@@ -18,7 +18,7 @@ use axum::{
 };
 use frameweaverd::{
     comfy::ComfyApi,
-    jobs::{JobRepository, NewJob},
+    jobs::{JobRepository, JobStatus, NewJob},
     proxy::{ProxyConfig, build_router as build_proxy_router, controlled_upstream_url},
     static_files::build_router as build_static_router,
     workers::WorkerRegistry,
@@ -534,6 +534,10 @@ async fn proxy_allowlist_rejects_bare_history_and_unknown_custom_reads() {
     );
     for path in [
         "object_info/CheckpointLoaderSimple",
+        "object_info/UNETLoader",
+        "object_info/CLIPLoader",
+        "object_info/VAELoader",
+        "system_stats",
         "frameweaver/lora_meta",
     ] {
         assert_eq!(
@@ -836,5 +840,76 @@ async fn proxy_logs_capture_only_operation_results_without_request_secrets() {
     );
 
     proxy_server.abort();
+    upstream_server.abort();
+}
+
+#[tokio::test]
+async fn native_media_owner_query_is_checked_against_persisted_outputs() {
+    let record = UpstreamRecord::default();
+    let (upstream_url, upstream_server) =
+        start_server(Router::new().fallback(any(upstream)).with_state(record)).await;
+    let repository = JobRepository::open(
+        std::env::temp_dir().join(format!("frameweaver-native-media-{}.db", Uuid::new_v4())),
+    )
+    .await
+    .unwrap();
+    let owner = Uuid::new_v4().to_string();
+    let job = repository
+        .create_routed(
+            NewJob {
+                owner_id: owner.clone(),
+                kind: "image".into(),
+                mode: "zimage".into(),
+                prompt: "fixture".into(),
+                settings_json: "{}".into(),
+            },
+            Some("rtx4090"),
+        )
+        .await
+        .unwrap();
+    repository
+        .reconcile_observed_status(
+            &job.id,
+            JobStatus::Queued,
+            JobStatus::Succeeded,
+            Some(r#"[{"filename":"result.png","subfolder":"","type":"output"}]"#),
+            None,
+        )
+        .await
+        .unwrap();
+    let comfy = ComfyApi::new(upstream_url.parse().unwrap()).unwrap();
+    let workers = WorkerRegistry::local(comfy);
+    let (base, proxy_task) = start_server(build_proxy_router(
+        ProxyConfig::new(upstream_url.parse().unwrap(), Duration::from_secs(1))
+            .with_job_routing(repository, workers),
+    ))
+    .await;
+    let uri = format!(
+        "{base}/comfy/view?filename=result.png&prompt_id={}&owner={owner}",
+        job.id
+    );
+    assert_eq!(reqwest::get(&uri).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        reqwest::get(uri.replace(&owner, &Uuid::new_v4().to_string()))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        reqwest::get(uri.replace("result.png", "another.png"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        reqwest::get(format!("{base}/comfy/system_stats"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    proxy_task.abort();
     upstream_server.abort();
 }

@@ -65,4 +65,19 @@ describe('createAdaptivePoller', () => {
 
     expect(calls).toBe(1)
   })
+  it('wakes a hidden-tab timer immediately without overlapping polls', async () => {
+    let calls = 0
+    let delay = 60_000
+    const poller = createAdaptivePoller({ poll: async () => { calls++ }, delay: () => delay })
+    poller.start()
+    await vi.advanceTimersByTimeAsync(0)
+    delay = 2_000
+    poller.wake()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(calls).toBe(2)
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(calls).toBe(3)
+    poller.stop()
+  })
+
 })

@@ -155,7 +155,7 @@ export class ComfyClient {
     form.append('image', file)
     form.append('type', 'input')
     form.append('overwrite', 'false')
-    const res = await fetch(`${this.baseUrl}/upload/image`, { method: 'POST', body: form })
+    const res = await fetch(`${this.baseUrl}/upload/image`, { method: 'POST', headers: { 'X-FrameWeaver-Owner': getOwnerId() }, body: form })
     if (!res.ok) throw new Error(`画像アップロード失敗 (${res.status})`)
     const json = (await res.json()) as { name: string; subfolder: string }
     return json.subfolder ? `${json.subfolder}/${json.name}` : json.name
@@ -212,7 +212,7 @@ export class ComfyClient {
 
   /** 完了したジョブの動画出力(SaveVideoノードの出力)を取得 */
   async fetchOutputs(promptId: string): Promise<HistoryOutput[]> {
-    const res = await fetch(`${this.baseUrl}/history/${promptId}`)
+    const res = await fetch(`${this.baseUrl}/history/${promptId}`, { headers: { 'X-FrameWeaver-Owner': getOwnerId() } })
     if (!res.ok) return []
     const json = (await res.json()) as Record<string, { outputs?: Record<string, Record<string, unknown>> }>
     const entry = json[promptId]
@@ -238,7 +238,10 @@ export class ComfyClient {
       subfolder: output.subfolder,
       type: output.type,
     })
-    if (promptId) params.set('prompt_id', promptId)
+    if (promptId) {
+      params.set('prompt_id', promptId)
+      params.set('owner', getOwnerId())
+    }
     return `${this.baseUrl}/view?${params}`
   }
 
@@ -256,7 +259,7 @@ export class ComfyClient {
 
   /** 完了ジョブのテキスト出力(PreviewAny等の ui.text)を取得。無ければ null */
   async fetchTextOutput(promptId: string): Promise<string | null> {
-    const res = await fetch(`${this.baseUrl}/history/${promptId}`)
+    const res = await fetch(`${this.baseUrl}/history/${promptId}`, { headers: { 'X-FrameWeaver-Owner': getOwnerId() } })
     if (!res.ok) return null
     const json = (await res.json()) as Record<string, { outputs?: Record<string, { text?: string[] }> }>
     const entry = json[promptId]

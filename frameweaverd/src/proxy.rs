@@ -179,15 +179,25 @@ async fn upstream_for_request(
                 .and_then(|value| value.to_str().ok())
                 .filter(|value| Uuid::parse_str(value).is_ok())
                 .map(str::to_owned)
-        })?;
+        });
     let job_id = if let Some(id) = path.strip_prefix("history/") {
         id.to_owned()
     } else if path == "view" {
         url::form_urlencoded::parse(query.unwrap_or_default().as_bytes())
             .find_map(|(key, value)| (key == "prompt_id").then(|| value.into_owned()))?
     } else {
-        return Some(config.upstream.clone());
+        return (path != "upload/image" || owner.is_some()).then(|| config.upstream.clone());
     };
+    let owner = owner.or_else(|| {
+        if path != "view" {
+            return None;
+        }
+        url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()).find_map(
+            |(key, value)| {
+                (key == "owner" && Uuid::parse_str(&value).is_ok()).then(|| value.into_owned())
+            },
+        )
+    })?;
     let job = routing
         .repository
         .get_for_owner(&job_id, &owner)
@@ -231,6 +241,10 @@ fn allowed_http_route(method: &axum::http::Method, path: &str) -> bool {
         return false;
     }
     path == "view"
+        || path == "system_stats"
+        || path == "object_info/UNETLoader"
+        || path == "object_info/CLIPLoader"
+        || path == "object_info/VAELoader"
         || path == "object_info/LoraLoaderModelOnly"
         || path == "object_info/CheckpointLoaderSimple"
         || path == "frameweaver/lora_meta"

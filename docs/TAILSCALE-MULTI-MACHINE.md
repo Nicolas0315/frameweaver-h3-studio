@@ -143,3 +143,8 @@ npm run dev -- --host 127.0.0.1
 | 1台だけ遅い | そのGPU PCのVRAM、RAM、SSD、ComfyUIキューを個別確認 |
 
 Tailscale Serveの現行仕様は、[公式Serveドキュメント](https://tailscale.com/docs/features/tailscale-serve)と[CLIリファレンス](https://tailscale.com/docs/reference/tailscale-cli/serve)を参照してください。
+
+
+### Reverse proxyのOrigin
+
+Comfyプロキシはブラウザの元Originを検証した後で上流Originへ正規化します。Reverse proxyがHostを書き換える場合は、起動時の `FRAMEWEAVER_TRUSTED_ORIGINS` にFrameWeaverの公開Originをカンマ区切りで明示してください（例: `https://YOUR-NODE.example:10000`）。任意の外部Originを許可しないでください。HTTPとWebSocketに同じ検証を適用します。

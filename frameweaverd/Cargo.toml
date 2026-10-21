@@ -2,6 +2,7 @@
 name = "frameweaverd"
 version = "0.1.0"
 edition = "2024"
+default-run = "frameweaverd"
 
 [[bin]]
 name = "frameweaverd"
@@ -16,7 +17,7 @@ serde_json = "1"
 # SQLite is embedded; HTTPS uses reqwest's independent rustls-tls feature.
 sqlx = { version = "0.8", default-features = false, features = ["macros", "migrate", "runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "signal", "sync", "time"] }
-tokio-tungstenite = "0.28"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

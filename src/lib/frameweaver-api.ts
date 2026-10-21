@@ -98,6 +98,11 @@ export class FrameWeaverApi {
     return (await this.json<{ jobs: FrameWeaverJob[] }>(response)).jobs
   }
 
+  async getJob(id: string): Promise<FrameWeaverJob> {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(id)}`, { headers: this.headers() })
+    return this.json<FrameWeaverJob>(response)
+  }
+
   async cancelJob(id: string): Promise<FrameWeaverJob> {
     const response = await fetch(`/api/jobs/${encodeURIComponent(id)}`, {
       method: 'DELETE',

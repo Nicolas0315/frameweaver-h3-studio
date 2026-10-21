@@ -9,6 +9,7 @@ use frameweaverd::{
         api::{build_routed_router as build_jobs_router, reconcile_incomplete_routed},
     },
     proxy::{ProxyConfig, build_router as build_proxy_router},
+    rewriter::build_router as build_rewriter_router,
     static_files,
     workers::{WorkerRegistry, build_router as build_workers_router},
 };
@@ -71,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .merge(build_auth_router(auth.clone()))
             .merge(protect_router(
                 build_fleet_router(fleet)
+                    .merge(build_rewriter_router("http://127.0.0.1:11434".parse()?)?)
                     .merge(build_workers_router(workers.clone()))
                     .merge(build_jobs_router(repository.clone(), workers.clone()))
                     .merge(build_proxy_router(

@@ -20,6 +20,10 @@ async fn main() {
         listener,
         Router::new()
             .route("/system_stats", get(system_stats))
+            .route(
+                "/queue",
+                get(|| async { Json(json!({"queue_running":[],"queue_pending":[]})) }),
+            )
             .route("/prompt", post(prompt))
             .route("/api/jobs/{id}", get(job))
             .route("/api/jobs/{id}/cancel", post(cancel))
@@ -31,7 +35,9 @@ async fn main() {
 
 async fn system_stats() -> Json<Value> {
     println!("GET /system_stats");
-    Json(json!({"system": {"mock": true}}))
+    Json(
+        json!({"system": {"mock": true}, "devices":[{"name":"Fixture GPU","type":"cuda","vram_total":25769803776_u64,"vram_free":21474836480_u64}]}),
+    )
 }
 
 async fn prompt(Json(body): Json<Value>) -> Json<Value> {
@@ -41,7 +47,7 @@ async fn prompt(Json(body): Json<Value>) -> Json<Value> {
 
 async fn job(Path(id): Path<String>) -> Json<Value> {
     println!("GET /api/jobs/{id}");
-    Json(json!({"status": "pending", "outputs": [], "error": null}))
+    Json(json!({"status": "pending", "outputs": {}, "error": null}))
 }
 
 async fn cancel(Path(id): Path<String>) -> Json<Value> {
@@ -59,5 +65,15 @@ async fn echo(mut socket: WebSocket) {
         if socket.send(message).await.is_err() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn shadow_job_matches_the_comfy_response_contract() {
+        let payload = job(Path("fixture".to_owned())).await.0;
+        let _: frameweaverd::comfy::RemoteJob = serde_json::from_value(payload).unwrap();
     }
 }
