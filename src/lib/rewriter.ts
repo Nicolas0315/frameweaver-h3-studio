@@ -168,9 +168,9 @@ function requestedVisibleText(input: string): Set<string> {
     const value = match[1] ?? match[2] ?? match[3]
     const before = input.slice(Math.max(0, (match.index ?? 0) - 60), match.index)
     const after = input.slice((match.index ?? 0) + match[0].length, (match.index ?? 0) + match[0].length + 40)
-    const japaneseNegative = /^\s*(?:と)?\s*(?:表示|記載|印字|描画|書|入れ)[^。、\r\n]{0,12}(?:しない|しません|不要|禁止|なし)/.test(after)
-    const englishNegative = /(?:do\s+not|don't|not|without)\s+(?:display|show|write)[^"\r\n]*$/i.test(before)
-    const japaneseDisplayRequest = /^\s*(?:と)?\s*(?:表示|記載|印字|描画|書(?:く|いて)|入れ(?:る|て))/.test(after)
+    const japaneseNegative = /^\s*(?:と)?\s*(?:表示|記載|印字|描画|書|入れ)[^。、\r\n]{0,12}(?:ない|ません|不要|禁止|なし)/.test(after)
+    const englishNegative = /(?:do\s+not|don't|not|without)\s+(?:display|show|write|render)[^"\r\n]*$/i.test(before)
+    const japaneseDisplayRequest = /^\s*(?:と)?\s*(?:表示|記載|印字|描画|書(?:く|いて|かれ(?:た|て))|入れ(?:る|て))/.test(after)
     const englishDisplayRequest = /(?:(?:sign|label|screen|display|poster|billboard|caption|text|logo|title|placard|marquee)\s+(?:reads?|says?|shows?|displays?)|(?:display|show|write|render)|text\s+is)\s*$/i.test(before)
     if (!japaneseNegative && !englishNegative && (japaneseDisplayRequest || englishDisplayRequest)) requested.add(value)
   }
@@ -220,16 +220,21 @@ export function validateVideoRewrite(output: string, durationSec: number, mode: 
   }
   const structuralDescription = withoutPreservedContent(lines[0].slice(fields[0].length).trim())
   if (!structuralDescription.startsWith('[Shot 1]')) throw new Error('プロンプト強化のShot番号が不正です')
-  const laterShotHeaders = [...structuralDescription.matchAll(/\[Shot (\d+)\]\s+At\s+(\d{2}):(\d{2}\.\d{3})(,?)/g)]
-  const shots = [1, ...laterShotHeaders.map((match) => Number(match[1]))]
+  const markers = [...structuralDescription.matchAll(/\[Shot (\d+)\]/g)]
+  const shots = markers.map((match) => Number(match[1]))
   if (shots.length === 0 || shots.some((shot, index) => shot !== index + 1)) throw new Error('プロンプト強化のShot番号が不正です')
+  const laterShotHeaders = markers.slice(1).map((marker) => {
+    const header = /^\[Shot (\d+)\]\s+At\s+(\d{2}):(\d{2}\.\d{3})(,?)/.exec(structuralDescription.slice(marker.index))
+    if (!header) throw new Error('プロンプト強化のShot時刻が不正です')
+    return header
+  })
   if (mode === 'first_last' || mode === 'last') {
     const match = mode === 'first_last'
       ? /Picture 2 \(from Shot (\d+)\)/.exec(text)
       : /<Picture 1> \(from \[Shot (\d+)\]\)/.exec(text)
     if (!match || Number(match[1]) !== shots.at(-1)) throw new Error('プロンプト強化の参照画像アラインメントが不正です')
   }
-  let previousSeconds = -1
+  let previousSeconds = 0
   for (const match of laterShotHeaders) {
     const seconds = Number(match[2]) * 60 + Number(match[3])
     if (seconds >= durationSec) throw new Error('プロンプト強化のShot時刻が動画尺を超えています')
