@@ -168,7 +168,8 @@ function requestedVisibleText(input: string): Set<string> {
     const value = match[1] ?? match[2] ?? match[3]
     const before = input.slice(Math.max(0, (match.index ?? 0) - 60), match.index)
     const after = input.slice((match.index ?? 0) + match[0].length, (match.index ?? 0) + match[0].length + 40)
-    const japaneseNegative = /^\s*(?:と)?\s*(?:表示|記載|印字|描画|書|入れ)[^。、\r\n]{0,12}(?:ない|ません|不要|禁止|なし)/.test(after)
+    const negativeEnding = '(?:ない|ません|なかった|て(?:い(?:ない|ません|なかった)|は(?:いけない|ならない)))'
+    const japaneseNegative = new RegExp(String.raw`^\s*(?:と)?\s*(?:(?:表示|記載|印字|描画)(?:(?:し|され)${negativeEnding}|不要|禁止|なし)|書(?:か${negativeEnding}|かれ${negativeEnding}|きません|いて(?:い(?:ない|ません|なかった)|は(?:いけない|ならない)))|入れ${negativeEnding})`).test(after)
     const englishNegative = /(?:do\s+not|don't|not|without)\s+(?:display|show|write|render)[^"\r\n]*$/i.test(before)
     const japaneseDisplayRequest = /^\s*(?:と)?\s*(?:表示|記載|印字|描画|書(?:く|いて|かれ(?:た|て))|入れ(?:る|て))/.test(after)
     const englishDisplayRequest = /(?:(?:sign|label|screen|display|poster|billboard|caption|text|logo|title|placard|marquee)\s+(?:reads?|says?|shows?|displays?)|(?:display|show|write|render)|text\s+is)\s*$/i.test(before)
