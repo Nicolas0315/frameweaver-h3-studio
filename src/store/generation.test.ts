@@ -51,7 +51,7 @@ const completedJob = {
 }
 
 describe('generation store API history integration', () => {
-  it('replaces the one-time legacy fallback with API jobs and restores Comfy output URLs', async () => {
+  it('displays API jobs without deleting unmigrated legacy history and restores Comfy output URLs', async () => {
     await vi.waitFor(() => {
       expect(useGenerationStore.getState().history).toEqual([expect.objectContaining({
         promptId: completedJob.id,
@@ -60,6 +60,7 @@ describe('generation store API history integration', () => {
       })])
     })
     expect(historyFromJob(completedJob)).toEqual(expect.objectContaining({ filename: 'result.png' }))
+    expect(JSON.parse(localStorage.getItem('frameweaver-history') ?? 'null')).toEqual([{ promptId: 'legacy-job' }])
   })
 
   it('keeps the active job and reports cancellation failures', async () => {

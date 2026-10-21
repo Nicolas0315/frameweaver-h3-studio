@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { ComfyClient, type HistoryOutput } from '../lib/comfy-client'
-import { clearLegacyHistory, FrameWeaverApiError, frameWeaverApi, takeLegacyHistory, type FrameWeaverJob } from '../lib/frameweaver-api'
+import { FrameWeaverApiError, frameWeaverApi, takeLegacyHistory, type FrameWeaverJob } from '../lib/frameweaver-api'
 import { DRAFT_KEYS, loadDraft, saveDraft } from '../lib/draft'
 import { createAdaptivePoller, pollDelay } from '../lib/adaptive-poller'
 import { buildImageWorkflow } from '../lib/image-workflow'
@@ -887,7 +887,7 @@ vramPoller.start()
 
 void frameWeaverApi.listJobs()
   .then((jobs) => {
-    clearLegacyHistory()
+    // API取得の成功は旧履歴の移行完了を意味しない。未移行のローカル履歴は保持する。
     useGenerationStore.setState({ history: jobs.map(historyFromJob) })
   })
   .catch(() => {
