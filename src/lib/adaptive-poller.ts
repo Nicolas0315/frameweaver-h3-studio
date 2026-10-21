@@ -14,12 +14,14 @@ export interface AdaptivePoller {
   start(): void
   stop(): void
   trigger(): Promise<void>
+  wake(): void
 }
 
 export function createAdaptivePoller(options: AdaptivePollerOptions): AdaptivePoller {
   let active = false
   let timer: ReturnType<typeof setTimeout> | null = null
   let inFlight: Promise<void> | null = null
+  let revision = 0
 
   const trigger = (): Promise<void> => {
     if (inFlight) return inFlight
@@ -28,12 +30,20 @@ export function createAdaptivePoller(options: AdaptivePollerOptions): AdaptivePo
   }
 
   const cycle = async (): Promise<void> => {
+    const currentRevision = ++revision
     try {
       await trigger()
     } catch {
       // The next scheduled poll is the retry boundary.
     }
-    if (active) timer = setTimeout(() => { void cycle() }, options.delay())
+    if (active && currentRevision === revision) timer = setTimeout(() => { void cycle() }, options.delay())
+  }
+
+  const wake = () => {
+    if (!active) return
+    if (timer) clearTimeout(timer)
+    timer = null
+    void cycle()
   }
 
   return {
@@ -44,9 +54,11 @@ export function createAdaptivePoller(options: AdaptivePollerOptions): AdaptivePo
     },
     stop() {
       active = false
+      revision++
       if (timer) clearTimeout(timer)
       timer = null
     },
     trigger,
+    wake,
   }
 }

@@ -13,7 +13,7 @@ function imageSnapshot(overrides: Partial<NodeCapabilitySnapshot> = {}): NodeCap
     devices: [{ name: 'Test GPU', kind: 'cuda', vramTotal: 24 * 1024 ** 3, vramFree: 20 * 1024 ** 3 }],
     queueRemaining: 0,
     inventory: {
-      checkpoints: ['models\\WAIILLUSTRIOUSSDXL_V170.SAFETENSORS'],
+      checkpoints: ['waiillustrioussdxl_v170.safetensors'],
       unets: ['z_image_turbo_nvfp4.safetensors'],
       clips: ['qwen_3_4b.safetensors'],
       vaes: ['ae_zimage.safetensors'],
@@ -92,5 +92,33 @@ describe('rankModels', () => {
 
     expect(zimage?.status).toBe('unavailable')
     expect(zimage?.missingFiles).toEqual(['qwen_3_4b.safetensors'])
+  })
+})
+
+
+describe('reviewed capability boundaries', () => {
+  it('uses the first execution device even when the second GPU is larger', () => {
+    const snapshot = imageSnapshot()
+    snapshot.devices.unshift({ name: 'Execution GPU', kind: 'cuda', vramTotal: 4 * 1024 ** 3, vramFree: 3 * 1024 ** 3 })
+    expect(rankModels(snapshot, 'image').find((fit) => fit.model.id === 'zimage')?.status).toBe('unavailable')
+  })
+  it('ranks the selected anime checkpoint', () => {
+    const snapshot = imageSnapshot()
+    snapshot.inventory.checkpoints = ['alternative.safetensors']
+    expect(rankModels(snapshot, 'image', 'alternative.safetensors').find((fit) => fit.model.id === 'anime')?.status).toBe('recommended')
+  })
+  it('does not accept subfolder paths for workflows submitting a bare filename', () => {
+    const snapshot = imageSnapshot()
+    snapshot.inventory.unets = ['sub/z_image_turbo_nvfp4.safetensors']
+    expect(rankModels(snapshot, 'image').find((fit) => fit.model.id === 'zimage')?.missingFiles).toContain('z_image_turbo_nvfp4.safetensors')
+  })
+  it('requires both H3 VAEs', () => {
+    const snapshot = imageSnapshot()
+    snapshot.inventory.unets = ['minimax_h3_fl2va_pruned_int8_convrot.safetensors']
+    snapshot.inventory.clips = ['qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors']
+    snapshot.inventory.vaes = ['minimax_h3_video_vae_fp16.safetensors']
+    expect(rankModels(snapshot, 'video')[0].missingFiles).toContain('minimax_h3_audio_vae_fp32.safetensors')
+    snapshot.inventory.vaes.push('minimax_h3_audio_vae_fp32.safetensors')
+    expect(rankModels(snapshot, 'video')[0].status).toBe('recommended')
   })
 })

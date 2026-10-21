@@ -72,6 +72,10 @@ async function main() {
     else {
       const payload = await response.json()
       checks.systemStats = Array.isArray(payload?.devices) && payload.devices.length > 0
+        && payload.devices.every((device) => device !== null && typeof device === 'object'
+          && !Array.isArray(device)
+          && typeof device.vram_total === 'number' && Number.isFinite(device.vram_total) && device.vram_total >= 0
+          && typeof device.vram_free === 'number' && Number.isFinite(device.vram_free) && device.vram_free >= 0)
       if (!checks.systemStats) errors.push('system-stats-invalid-payload')
     }
   } catch (error) {

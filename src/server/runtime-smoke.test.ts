@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 const cliPath = fileURLToPath(new URL('../../scripts/verify-runtime.mjs', import.meta.url))
 const servers: Server[] = []
 
-async function startRuntimeServer(apiReady: boolean): Promise<string> {
+async function startRuntimeServer(apiReady: boolean, devices: unknown[] = [{ name: 'GPU', type: 'cuda', vram_total: 24, vram_free: 20 }]): Promise<string> {
   const server = createServer((request, response) => {
     const path = request.url ?? '/'
     if (path === '/') {
@@ -21,7 +21,7 @@ async function startRuntimeServer(apiReady: boolean): Promise<string> {
     }
     if (path === '/comfy/system_stats') {
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ devices: [{ name: 'GPU', type: 'cuda', vram_total: 24, vram_free: 20 }] }))
+      response.end(JSON.stringify({ devices }))
       return
     }
     const className = path.split('/').at(-1) ?? ''
@@ -98,4 +98,12 @@ describe('verify-runtime CLI', () => {
     expect(summary.errors).toContain('system-stats-http-503')
     expect(result.stdout).not.toContain('backend unavailable')
   })
+})
+
+
+it.each([[null], [{}], [{ vram_total: -1, vram_free: 0 }]])('rejects malformed system stats device %j', async (device) => {
+  const baseUrl = await startRuntimeServer(true, [device])
+  const result = await runCli(baseUrl)
+  expect(result.code).toBe(1)
+  expect(JSON.parse(result.stdout).checks.systemStats).toBe(false)
 })

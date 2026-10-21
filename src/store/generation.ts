@@ -212,6 +212,9 @@ export function imageSlots(mode: GenerationMode): [number, number] {
   }
 }
 
+let capabilityRefreshInFlight: Promise<void> | null = null
+let lastCapabilityAttempt = 0
+
 export const useGenerationStore = create<GenerationState>((set, get) => ({
   connected: false,
   wsConnected: false,
@@ -441,19 +444,21 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
     set({ loraMeta, loraList })
   },
 
-  refreshCapability: async () => {
-    const capability = await client.capabilities()
-    const primary = capability.devices.reduce<(typeof capability.devices)[number] | null>(
-      (best, device) => !best || device.vramTotal > best.vramTotal ? device : best,
-      null,
-    )
-    set({
-      capability,
-      connected: capability.status === 'ready' || capability.status === 'degraded',
-      ...(primary ? { vram: { total: primary.vramTotal, free: primary.vramFree } } : {}),
-      checkpointList: capability.inventory.checkpoints,
-      loraList: capability.inventory.loras,
-    })
+  refreshCapability: () => {
+    if (capabilityRefreshInFlight) return capabilityRefreshInFlight
+    lastCapabilityAttempt = Date.now()
+    capabilityRefreshInFlight = (async () => {
+      const capability = await client.capabilities()
+      const primary = capability.devices[0]
+      set({
+        capability,
+        connected: capability.status === 'ready' || capability.status === 'degraded',
+        ...(primary ? { vram: { total: primary.vramTotal, free: primary.vramFree } } : {}),
+        checkpointList: capability.inventory.checkpoints,
+        loraList: capability.inventory.loras,
+      })
+    })().finally(() => { capabilityRefreshInFlight = null })
+    return capabilityRefreshInFlight
   },
 
   applyLoraFromCatalog: (metaKey) => {
@@ -863,10 +868,17 @@ useGenerationStore.subscribe((s, prev) => {
 })
 
 // VRAMだけを軽量監視。モデル在庫は接続時または手動更新時に取得する。
+let restWasAvailable = false
 const vramPoller = createAdaptivePoller({
   poll: async () => {
     const stats = await client.systemStats()
     if (stats) {
+      const capability = useGenerationStore.getState().capability
+      const recovered = !restWasAvailable
+      restWasAvailable = true
+      if (!capability || recovered || (capability.status !== 'ready' && Date.now() - lastCapabilityAttempt >= 30_000)) {
+        await useGenerationStore.getState().refreshCapability()
+      }
       useGenerationStore.setState((state) => ({
         vram: { total: stats.vramTotal, free: stats.vramFree },
         connected: true,
@@ -874,7 +886,7 @@ const vramPoller = createAdaptivePoller({
           ? {
               ...state.capability,
               capturedAt: new Date().toISOString(),
-              status: state.capability.errors.length > 0 ? 'degraded' : 'ready',
+              status: state.capability.status === 'unavailable' ? 'unavailable' : state.capability.errors.length > 0 ? 'degraded' : 'ready',
               devices: state.capability.devices.length > 0
                 ? state.capability.devices.map((device, index) => index === 0
                     ? { ...device, vramTotal: stats.vramTotal, vramFree: stats.vramFree }
@@ -885,6 +897,7 @@ const vramPoller = createAdaptivePoller({
       }))
       return
     }
+    restWasAvailable = false
     useGenerationStore.setState((state) => ({
       connected: false,
       capability: state.capability ? { ...state.capability, status: 'stale' } : null,
@@ -896,3 +909,10 @@ const vramPoller = createAdaptivePoller({
   ),
 })
 vramPoller.start()
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => vramPoller.wake())
+}
+useGenerationStore.subscribe((state, previous) => {
+  if (state.status !== previous.status) vramPoller.wake()
+})

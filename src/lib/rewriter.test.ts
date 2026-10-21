@@ -129,3 +129,26 @@ describe('rewriter output contracts', () => {
     expect(result).not.toMatch(/[぀-ヿ㐀-鿿가-힯]/)
   })
 })
+
+
+describe('additional reviewed rewrite contracts', () => {
+  const words = 'detail '.repeat(65)
+  it('excludes negated render requests', () => {
+    const output = `A blank sign. ${words}`.trim()
+    expect(validateImageRewrite(output, 'Do not render "OPEN"', 'krea2')).toBe(output)
+  })
+  it.each(['「営業中」と書かれた看板', '看板に「営業中」と書かれている'])('retains passive display request: %s', (input) => {
+    expect(validateImageRewrite(`A sign reads "営業中". ${words}`, input, 'krea2')).toContain('営業中')
+  })
+  it('excludes negated passive display requests', () => {
+    const output = `A blank sign. ${words}`.trim()
+    expect(validateImageRewrite(output, '看板に「営業中」と書かれていない', 'krea2')).toBe(output)
+  })
+  it.each(['[Shot 2] movement.', '[Shot 2]: At 00:06.000, movement.', '[Shot 2] At 00:00.000, movement.'])('rejects malformed or non-advancing later shots: %s', (shot) => {
+    expect(() => validateVideoRewrite(`integrated_multimodal_description: [Shot 1] A room. ${shot}\noverall_soundscape: room tone.\nnon_diegetic_music: none.`, 5)).toThrow()
+  })
+  it('does not strip requested passive CJK text during fallback', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ response: `A sign reads "営業中" with 美しい styling. ${words}` })))
+    await expect(rewriteImageViaOllama('「営業中」と書かれた看板', 'krea2')).rejects.toThrow('英語以外')
+  })
+})

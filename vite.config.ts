@@ -1,4 +1,5 @@
 import { defineConfig, type ProxyOptions } from 'vite'
+import { comfyOriginGuard } from './src/server/comfy-origin.ts'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { createRewriterGateway } from './src/server/rewriter-gateway.ts'
@@ -15,7 +16,7 @@ const comfyProxy: Record<string, string | ProxyOptions> = {
     ws: true,
     // ComfyUIはWebSocketのOriginを検査する。外部のTailnetホスト名や任意の
     // Vite開発ポートをそのまま渡すと403になるため、同一上流Originへ正規化する。
-    headers: { origin: new URL(COMFY_TARGET).origin },
+    configure: comfyOriginGuard(COMFY_TARGET, (process.env.FRAMEWEAVER_TRUSTED_ORIGINS ?? '').split(',').filter(Boolean)),
     rewrite: (path) => path.replace(/^\/comfy/, ''),
   },
 }

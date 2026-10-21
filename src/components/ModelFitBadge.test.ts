@@ -46,3 +46,10 @@ describe('ModelFitBadge presentation', () => {
     expect(modelFitSummary(value)).toBe('不足: qwen_3_4b.safetensors')
   })
 })
+
+
+it('keeps unavailable API distinct from missing models', () => {
+  const value = fit({ status: 'unavailable', reasons: ['capability-unavailable', 'missing-model-files'], missingFiles: ['model'] })
+  expect(modelFitLabel(value)).toBe('確認不可')
+  expect(modelFitSummary(value)).toBe('能力API停止')
+})
