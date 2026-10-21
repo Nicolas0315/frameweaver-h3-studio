@@ -152,3 +152,15 @@ describe('additional reviewed rewrite contracts', () => {
     await expect(rewriteImageViaOllama('「営業中」と書かれた看板', 'krea2')).rejects.toThrow('英語以外')
   })
 })
+
+
+it('does not treat an unrelated negative clause as negated signage', () => {
+  const output = `A sign reads "営業中". ${'detail '.repeat(65)}`.trim()
+  expect(validateImageRewrite(output, '「営業中」と書かれた看板を写すが人はいない', 'krea2')).toBe(output)
+})
+
+
+it.each(['看板に「営業中」と表示していない', '看板に「営業中」と書いていない', '看板に「営業中」と書いてはいけない'])('keeps conjugated display negation: %s', (input) => {
+  const output = `A blank sign. ${'detail '.repeat(65)}`.trim()
+  expect(validateImageRewrite(output, input, 'krea2')).toBe(output)
+})

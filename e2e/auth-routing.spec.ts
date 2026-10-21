@@ -35,7 +35,7 @@ for (const completedAtCreate of [true, false]) {
     await page.route('**/rewriter/models', (route) => route.fulfill({ json: { models: [] } }))
     await page.routeWebSocket('**/comfy/ws**', () => {})
     const jobId = '22222222-2222-4222-8222-222222222222'
-    let stored: Record<string, unknown>
+    let stored: Record<string, unknown> = {}
     let reads = 0
     await page.route('**/api/jobs', async (route) => {
       const input = route.request().postDataJSON() as { mode: string; prompt: string; settings: object }
@@ -55,6 +55,7 @@ for (const completedAtCreate of [true, false]) {
       contentType: 'image/png', body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64'),
     }))
     await page.goto('/')
+    await page.getByRole('button', { name: '閉じる', exact: true }).click()
     await page.getByRole('button', { name: /画像生成.*Krea/ }).click()
     await page.getByPlaceholder(/生成したい画像を詳しく/).fill('fixture image')
     await page.locator('.generate-bar').getByRole('button', { name: /画像/ }).click()
