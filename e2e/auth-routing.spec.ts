@@ -62,7 +62,8 @@ for (const completedAtCreate of [true, false]) {
     const result = page.getByAltText('生成画像')
     await expect(result).toBeVisible()
     await expect(result).toHaveAttribute('src', /prompt_id=22222222-2222-4222-8222-222222222222.*owner=/)
-    await expect(page.getByRole('button', { name: '■ 停止' })).toHaveCount(0)
+    await expect(page.locator('.generate-bar').getByRole('button', { name: '■ 停止' })).toHaveCount(0)
+    await expect(page.locator('.generate-bar').getByRole('button', { name: /画像/ })).toBeEnabled()
     if (!completedAtCreate) expect(reads).toBeGreaterThan(0)
   })
 }
